@@ -1,0 +1,7 @@
+build/
+build_*/
+*.pyc
+__pycache__/
+.vscode/
+.cache/
+compile_commands.json
