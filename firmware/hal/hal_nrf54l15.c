@@ -286,7 +286,7 @@ void hal_init(void) {
         0x01D60000UL, /* 115200 baud */
         &g_usb_rx_ring,
         UARTE22_IRQn,
-        3U
+        0U
     );
 
     /* 5. Configure UARTE21 (External Grove CRSF on P2.08 TXD, P2.07 RXD @ 420000 baud) */
@@ -306,7 +306,7 @@ void hal_init(void) {
         0x06B85000UL, /* 420000 baud (420000 * 2^32 / 16000000 = 0x06B851EB) */
         &g_crsf_rx_ring,
         UARTE21_IRQn,
-        2U
+        0U
     );
 
     /* 6. Configure SPIM00 for LR2021 (P2.01 SCK, P2.02 MOSI, P2.04 MISO @ 8 MHz) */

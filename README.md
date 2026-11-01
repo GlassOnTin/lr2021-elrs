@@ -168,11 +168,26 @@ txpkt <hex_bytes>                     - Transmit raw hex payload in BRIDGE mode
 scan <900|2400>                       - Sweep RSSI across Sub-GHz or 2.4 GHz band
 ```
 
+### 5. Reticulum (`RNS`) & Sideband LXMF / Telemetry Bridge (`tools/rns_sideband_bridge.py`)
+Run a ground Reticulum Transport node (`RNodeInterface` + `AutoInterface` + `TCPServerInterface` on port `4242`) and/or an airborne drone LXMF + MAVLink v2 companion (`FIELD_TELEMETRY` + `FIELD_ICON_APPEARANCE` + live flight controller command execution):
+```bash
+# Put both LR2021 EVKs into RNode KISS TNC mode
+./tools/lr2021_cli.py -p /dev/ttyACM5 configure --mode rnode
+./tools/lr2021_cli.py -p /dev/ttyACM7 configure --mode rnode
+
+# Launch Ground RNode Transport (/dev/ttyACM5) + Airborne Drone Companion (/dev/ttyACM7 + /dev/ttyACM4)
+python3 tools/rns_sideband_bridge.py both \
+    --ground-port /dev/ttyACM5 \
+    --drone-port /dev/ttyACM7 \
+    --fc-port /dev/ttyACM4 \
+    --freq 867200000 --bw 125000 --sf 7 --cr 5 --txpower 14
+```
+
 ---
 
 ## Measured Hardware Verification
 
-Tested on two `LR2021EVK1XBS1_XIAO` boards (`FC6D1A37` and `D56B6941`), a live **ArduPilot `TMotorH743` flight controller** (`/dev/ttyACM4`), and a live **RadioMaster TX16SMK3 ↔ RadioMaster XR4 (`2× LR1121`)** ExpressLRS link (`lr2021-elrs-demo`, `UID = 0A:B7:0C:7C:38:03`):
+Tested on two `LR2021EVK1XBS1_XIAO` boards (`FC6D1A37` and `D56B6941`), a live **ArduPilot `TMotorH743` flight controller** (`/dev/ttyACM4`), **Sideband v1.9.8** (`io.unsigned.sideband`) on Android (`127.0.0.1`), and a live **RadioMaster TX16SMK3 ↔ RadioMaster XR4 (`2× LR1121`)** ExpressLRS link (`lr2021-elrs-demo`, `UID = 0A:B7:0C:7C:38:03`):
 
 1. **Closed-Loop 867.2 MHz UK Sub-GHz `RNODE` KISS TNC ↔ Airborne `RELAY` ↔ Live `TMotorH743` Flight Controller:**
    - Verified full RNode KISS handshake (`CMD_DETECT=0x46`, `CMD_STAT_PHYPRM=040003d00012001300020006`, `CMD_READY=0x01`), live `TMotorH743` MAVLink v2 `HEARTBEAT` (`#0`) + `SYS_STATUS` (`#1`, `16,019 mV` 4S LiPo) + `GLOBAL_POSITION_INT` (`#33`) ingestion, over-the-air `rnlog.beacon` JSON reception (`rssi=-95 dBm`, `snr=+14.25 dB`), unmasked Reticulum packet store-and-forward (`hops: 0 -> 1`), 64-entry FNV-1a duplicate suppression (`relay_drop=1`), byte-for-byte IFAC packet preservation (`ifac=1`), and closed-loop execution of `LOITER`, `RTL`, `LAND`, `MODE 2`, `GOTO 0 0 85`, `ARM`, `DISARM`, and `MODE 0` on the live `TMotorH743` (`COMMAND_ACK result=0`, `MISSION_ACK`, and `HEARTBEAT.custom_mode` transitions `0 -> 5 -> 6 -> 9 -> 2 -> 0`):
@@ -190,7 +205,10 @@ Tested on two `LR2021EVK1XBS1_XIAO` boards (`FC6D1A37` and `D56B6941`), a live *
    RNS_CMD_RX src=ELRS_TUNNEL hops=0 cmd="RC 1620 1380 1050 1510" type=5 mav_len=30 mav_hex=FD12000003FFBE460000540664051A04E60500000000000000000101BA5A
    [TMotorH743 RC_CHANNELS] ch1=1620 ch2=1380 ch3=1050 ch4=1510 rssi=255
    ```
-3. **Live 2.4 GHz `2G4_K1000` (`CE_LBT`, 80 channels, 1000 Hz GFSK + Hamming FEC, 1:2 telemetry) Passive `MONITOR` (`TX16SMK3` ↔ `XR4`):**
+3. **End-to-End Official Reticulum (`RNS 1.5.7` `RNodeInterface`) & Sideband (`io.unsigned.sideband` v1.9.8) ↔ 867.2 MHz LoRa RF ↔ Live `TMotorH743`:**
+   - Verified transparent `RNODE_HW_MTU = 508` multi-frame LoRa fragmentation/reassembly (`<= 250 B` physical LoRa payloads with `0xFE 0xCA` framing) and non-blocking `BASEPRI` SPI critical sections so `UARTE22` / `UARTE21` RX interrupts never drop bytes during `CALIBRATE_FRONTEND`.
+   - Verified live Sideband announce discovery (`LR2021 Drone (TMotorH743) <dbe84551c59b392f43632c2982e3c6a4>`), `RNS.Link` establishment (`500 B` link MTU, `RTT = 560 ms`, `RSSI = -96 dBm`, `SNR = +14.25 dB`), bidirectional LXMF command execution (`rtl` and `mode 0` returning `ACK = 0`), quadcopter icon appearance (`FIELD_ICON_APPEARANCE`), and Sideband Telemetry screen rendering (`1024.17 mbar`, `38.5 °C`, `78.2%` / `16.01 V` battery, `Mode: RTL (6)`).
+4. **Live 2.4 GHz `2G4_K1000` (`CE_LBT`, 80 channels, 1000 Hz GFSK + Hamming FEC, 1:2 telemetry) Passive `MONITOR` (`TX16SMK3` ↔ `XR4`):**
    - Captures 500 Hz TX16SMK3 uplink (`SYNC` + `RCDATA`) and 500 Hz XR4 downlink (`LINKSTATS` + CRSF telemetry `DATA` frames) simultaneously (`1,789 / 1,842 = 97.1%` combined packet CRC rate over `2.0 s`, `phase_err = 4 us`).
 
 ### Limitations

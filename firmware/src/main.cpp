@@ -147,6 +147,36 @@ static lr2021_pkt_stats_t   g_rns_rx_stats;
 static volatile bool        g_rnode_tx_busy = false;
 static volatile bool        g_rnode_tx_done_notify = false;
 
+/* Multi-frame fragmentation/reassembly for RNode HW_MTU (up to 508B over <=255B LoRa PHY) */
+static uint8_t              g_rnode_tx_full_buf[RNODE_HW_MTU];
+static uint16_t             g_rnode_tx_full_len      = 0U;
+static uint8_t              g_rnode_tx_frag_seq      = 0U;
+static volatile uint8_t     g_rnode_tx_frag_idx      = 0U;
+static volatile uint8_t     g_rnode_tx_frag_total    = 0U;
+static volatile uint32_t    g_rnode_next_frag_due_ms = 0U;
+
+static uint8_t              g_rnode_rx_reasm_buf[RNODE_HW_MTU];
+static uint16_t             g_rnode_rx_reasm_len     = 0U;
+static uint8_t              g_rnode_rx_reasm_seq     = 0U;
+static uint8_t              g_rnode_rx_reasm_next    = 0U;
+
+static void rnode_send_next_tx_frag(void) {
+    uint16_t offset = (uint16_t)g_rnode_tx_frag_idx * 250U;
+    if (offset >= g_rnode_tx_full_len) {
+        return;
+    }
+    uint16_t rem = g_rnode_tx_full_len - offset;
+    uint8_t chunk = (rem > 250U) ? 250U : (uint8_t)rem;
+    uint8_t frag[254];
+    frag[0] = 0xFEU;
+    frag[1] = 0xCAU;
+    frag[2] = g_rnode_tx_frag_seq;
+    frag[3] = (uint8_t)((g_rnode_tx_frag_total << 4U) | (g_rnode_tx_frag_idx & 0x0FU));
+    memcpy(&frag[4], &g_rnode_tx_full_buf[offset], chunk);
+    g_rnode_tx_frag_idx++;
+    lr2021_tx_nb(frag, (uint8_t)(4U + chunk));
+}
+
 /* Airborne relay delayed rebroadcast queue */
 static bool                 g_relay_pending = false;
 static uint8_t              g_relay_tx_buf[RNODE_LORA_MAX_PKT];
@@ -445,6 +475,13 @@ static void elrs_hwtimer_tock_cb(void) {
 
 static void radio_tx_done_isr(void) {
     if (g_app_mode == APP_MODE_RNODE) {
+        if (g_rnode_tx_frag_idx < g_rnode_tx_frag_total) {
+            g_rnode_next_frag_due_ms = hal_millis() + 5U;
+            if (g_rnode_next_frag_due_ms == 0U) {
+                g_rnode_next_frag_due_ms = 1U;
+            }
+            return;
+        }
         g_rnode_tx_busy        = false;
         g_rnode_tx_done_notify = true;
         if (g_rnode_cfg.radio_online) {
@@ -821,6 +858,7 @@ static void on_rnode_kiss_frame(uint8_t cmd, const uint8_t *data, size_t len, vo
     switch (cmd) {
         case RNODE_CMD_DETECT:
             if (len >= 1U && data[0] == RNODE_DETECT_REQ) {
+                g_rnode_cfg.radio_online = false;
                 rnode_send_u8(RNODE_CMD_DETECT, RNODE_DETECT_RESP);
             }
             break;
@@ -965,11 +1003,23 @@ static void on_rnode_kiss_frame(uint8_t cmd, const uint8_t *data, size_t len, vo
             break;
 
         case RNODE_CMD_DATA:
-            if (len > 0U && len <= RNODE_LORA_MAX_PKT && g_rnode_cfg.radio_online) {
+            if (len > 0U && len <= RNODE_HW_MTU && g_rnode_cfg.radio_online) {
                 g_rnode_tx_busy = true;
                 g_rnode_cfg.tx_bytes += (uint32_t)len;
-                lr2021_tx_nb(data, (uint8_t)len);
-            } else if (len > RNODE_LORA_MAX_PKT) {
+                if (len <= 250U) {
+                    g_rnode_tx_frag_idx   = 0U;
+                    g_rnode_tx_frag_total = 0U;
+                    lr2021_tx_nb(data, (uint8_t)len);
+                } else {
+                    memcpy(g_rnode_tx_full_buf, data, len);
+                    g_rnode_tx_full_len      = (uint16_t)len;
+                    g_rnode_tx_frag_seq++;
+                    g_rnode_tx_frag_total    = (uint8_t)((len + 249U) / 250U);
+                    g_rnode_tx_frag_idx      = 0U;
+                    g_rnode_next_frag_due_ms = 0U;
+                    rnode_send_next_tx_frag();
+                }
+            } else if (len > RNODE_HW_MTU) {
                 rnode_send_u8(RNODE_CMD_ERROR, RNODE_ERR_TXFAILED);
             }
             break;
@@ -1792,12 +1842,17 @@ int main(void) {
         }
 
         /* 3. Handle RNode TX_DONE notification & incoming LoRa packets in RNODE / RELAY mode */
+        uint32_t now_ms = hal_millis();
+        if (g_app_mode == APP_MODE_RNODE && g_rnode_next_frag_due_ms != 0U &&
+            (int32_t)(now_ms - g_rnode_next_frag_due_ms) >= 0) {
+            g_rnode_next_frag_due_ms = 0U;
+            rnode_send_next_tx_frag();
+        }
         if (g_app_mode == APP_MODE_RNODE && g_rnode_tx_done_notify) {
             g_rnode_tx_done_notify = false;
             rnode_send_u8(RNODE_CMD_READY, 0x01U);
         }
 
-        uint32_t now_ms = hal_millis();
         if (g_rns_rx_flag) {
             uint8_t rx_copy[RNODE_LORA_MAX_PKT];
             uint8_t rx_len = g_rns_rx_len;
@@ -1806,13 +1861,43 @@ int main(void) {
             g_rns_rx_flag = false;
 
             if (g_app_mode == APP_MODE_RNODE) {
-                int rssi_enc = (int)rx_st.rssi_dbm + RNODE_RSSI_OFFSET;
-                if (rssi_enc < 0) rssi_enc = 0;
-                if (rssi_enc > 255) rssi_enc = 255;
-                rnode_send_u8(RNODE_CMD_STAT_RSSI, (uint8_t)rssi_enc);
-                rnode_send_u8(RNODE_CMD_STAT_SNR, (uint8_t)rx_st.snr_q2_db);
-                rnode_send_frame(RNODE_CMD_DATA, rx_copy, rx_len);
-                hal_led_toggle();
+                const uint8_t *emit_ptr = rx_copy;
+                uint16_t emit_len       = rx_len;
+                bool emit_ready         = true;
+
+                if (rx_len >= 5U && rx_copy[0] == 0xFEU && rx_copy[1] == 0xCAU) {
+                    uint8_t seq   = rx_copy[2];
+                    uint8_t total = (uint8_t)(rx_copy[3] >> 4U);
+                    uint8_t idx   = (uint8_t)(rx_copy[3] & 0x0FU);
+                    uint8_t clen  = (uint8_t)(rx_len - 4U);
+                    emit_ready    = false;
+                    if (idx == 0U && total > 1U) {
+                        memcpy(g_rnode_rx_reasm_buf, &rx_copy[4], clen);
+                        g_rnode_rx_reasm_len  = clen;
+                        g_rnode_rx_reasm_seq  = seq;
+                        g_rnode_rx_reasm_next = 1U;
+                    } else if (seq == g_rnode_rx_reasm_seq && idx == g_rnode_rx_reasm_next &&
+                               (uint16_t)(g_rnode_rx_reasm_len + clen) <= RNODE_HW_MTU) {
+                        memcpy(&g_rnode_rx_reasm_buf[g_rnode_rx_reasm_len], &rx_copy[4], clen);
+                        g_rnode_rx_reasm_len = (uint16_t)(g_rnode_rx_reasm_len + clen);
+                        g_rnode_rx_reasm_next++;
+                        if (g_rnode_rx_reasm_next >= total) {
+                            emit_ptr   = g_rnode_rx_reasm_buf;
+                            emit_len   = g_rnode_rx_reasm_len;
+                            emit_ready = true;
+                        }
+                    }
+                }
+
+                if (emit_ready) {
+                    int rssi_enc = (int)rx_st.rssi_dbm + RNODE_RSSI_OFFSET;
+                    if (rssi_enc < 0) rssi_enc = 0;
+                    if (rssi_enc > 255) rssi_enc = 255;
+                    rnode_send_u8(RNODE_CMD_STAT_RSSI, (uint8_t)rssi_enc);
+                    rnode_send_u8(RNODE_CMD_STAT_SNR, (uint8_t)rx_st.snr_q2_db);
+                    rnode_send_frame(RNODE_CMD_DATA, emit_ptr, emit_len);
+                    hal_led_toggle();
+                }
             } else if (g_app_mode == APP_MODE_RELAY) {
                 hal_led_toggle();
                 uint8_t orig_hops = (rx_len > 1U) ? rx_copy[1] : 0U;

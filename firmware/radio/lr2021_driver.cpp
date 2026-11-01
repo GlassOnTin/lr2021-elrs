@@ -88,15 +88,14 @@ static void fec_decode_14_to_8(const uint8_t *in14, uint8_t *out8) {
 }
 
 static inline uint32_t irq_save(void) {
-    uint32_t primask;
-    __asm volatile("mrs %0, primask\n\tcpsid i" : "=r"(primask) :: "memory");
-    return primask;
+    uint32_t basepri;
+    uint32_t mask = 0x10UL; /* Mask IRQ priority >= 1 (GPIOTE20/TIMER20), keep priority 0 (UARTE21/22) live */
+    __asm volatile("mrs %0, basepri\n\tmsr basepri_max, %1" : "=r"(basepri) : "r"(mask) : "memory");
+    return basepri;
 }
 
-static inline void irq_restore(uint32_t primask) {
-    if ((primask & 1UL) == 0UL) {
-        __asm volatile("cpsie i" ::: "memory");
-    }
+static inline void irq_restore(uint32_t basepri) {
+    __asm volatile("msr basepri, %0" :: "r"(basepri) : "memory");
 }
 
 static uint16_t lr2021_write_cmd(uint16_t opcode, const uint8_t *args, uint16_t arg_len, uint32_t wait_us) {
