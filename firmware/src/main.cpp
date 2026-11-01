@@ -1249,7 +1249,7 @@ static void print_status(void) {
                         (unsigned)g_downlink_lq,
                         (int)g_downlink_snr);
     hal_usb_uart_printf(
-        "RNS rnode_freq=%lu bw=%lu sf=%u cr=4/%u online=%u relay_fwd=%lu relay_drop=%lu "
+        "RNS rnode_freq=%lu bw=%lu sf=%u cr=4/%u online=%u relay_fwd=%lu relay_drop=%lu relay_exp=%lu "
         "tun_tx=%lu tun_rx=%lu fc_pkts=%lu fc_drop=%lu\r\n",
         (unsigned long)g_rnode_cfg.frequency_hz,
         (unsigned long)g_rnode_cfg.bandwidth_hz,
@@ -1258,6 +1258,7 @@ static void print_status(void) {
         g_rnode_cfg.radio_online ? 1U : 0U,
         (unsigned long)g_rns_relay.relayed_count,
         (unsigned long)g_rns_relay.dropped_dup_count,
+        (unsigned long)g_rns_relay.expired_hop_count,
         (unsigned long)g_elrs_tunnel.tx_msgs_sent,
         (unsigned long)g_elrs_tunnel.rx_msgs_completed,
         (unsigned long)g_fc_tlm.rx_mav_pkts,
@@ -1477,8 +1478,12 @@ static void inspect_and_act_on_rns_packet(const uint8_t *pkt, uint16_t len, cons
         /* 0d. Check if Multi-Drone Formation State / Setpoint Packet (RNSF context 0xA7) */
     rns_formation_pkt_t fp;
     if (rns_parse_formation_pkt(pkt, len, &fp)) {
+        /* In multi-hop bounce chain test mode, each hop `h` acts as virtual Drone Slot `(h + 1)` */
+        uint8_t eff_slot = g_rns_relay.bounce_test_mode
+                               ? (uint8_t)((hops + 1U <= 7U) ? (hops + 1U) : 7U)
+                               : g_swarm_slot_id;
         rns_drone_cmd_t fcmd;
-        if (rns_compute_formation_slot_cmd(&fp, g_swarm_slot_id, &fcmd)) {
+        if (rns_compute_formation_slot_cmd(&fp, eff_slot, &fcmd)) {
             uint8_t mav_frame[72];
             size_t mav_len = rns_build_mavlink_command(&fcmd, g_mav_tx_seq++, mav_frame, sizeof(mav_frame));
             if (mav_len > 0U) {
@@ -1487,7 +1492,7 @@ static void inspect_and_act_on_rns_packet(const uint8_t *pkt, uint16_t len, cons
             g_last_mesh_ctrl_ms = hal_millis();
             g_mesh_ctrl_active  = (fp.shape != RNS_FORM_HOLD_BRAKE);
             hal_usb_uart_printf("RNS_FORM_RX src=%s hops=%u seq=%u shape=%u slot=%u lat=%ld lon=%ld alt_mm=%ld vx=%d vy=%d mav_len=%u\r\n",
-                                src_tag, hops, (unsigned)fp.seq, (unsigned)fp.shape, (unsigned)g_swarm_slot_id,
+                                src_tag, hops, (unsigned)fp.seq, (unsigned)fp.shape, (unsigned)eff_slot,
                                 (long)fcmd.lat_deg_e7, (long)fcmd.lon_deg_e7, (long)fp.leader_alt_mm,
                                 (int)fp.vx_cms, (int)fp.vy_cms, (unsigned)mav_len);
             return;
@@ -1705,6 +1710,7 @@ static void handle_cli_command(char *line) {
             "  crsf_lua <status|peer|ann|pair|ping|loiter|rtl> - Test EdgeTX Lua CRSF 0x7A/0x7B bridge\r\n"
             "  crsf_ota <status|peer|ann|pair|ping|loiter|rtl> - Tunnel CRSF 0x7A request over the air to RX\r\n"
             "  rns_slot <0..7>                - Set drone formation slot (0=Leader, 1=Left1, 2=Right1, ...)\r\n"
+            "  rns_chain <off|max_hops> [delay_ms] [ttl_ms] - Multi-hop ping-pong relay test chain & expiration\r\n"
             "  rns_form <vee|line|col|hold> [spacing_m] [vn_ms] [ve_ms] [hdg_deg] - Broadcast formation state\r\n"
             "  rns_cmd <GOTO|VEL|BVL|RTL|LAND|LOITER|ARM|DISARM|MODE n|RC ...>    - Send RNS drone cmd\r\n"
             "  rns_tx <hex_bytes>             - Send raw Reticulum packet over Relay LoRa or ELRS tunnel\r\n"
@@ -2200,6 +2206,37 @@ static void handle_cli_command(char *line) {
         return;
     }
 
+    if (strcmp(cmd, "rns_chain") == 0) {
+        char *hops_s  = strtok(NULL, " ");
+        char *delay_s = strtok(NULL, " ");
+        char *ttl_s   = strtok(NULL, " ");
+        if (hops_s == NULL) {
+            hal_usb_uart_printf("RNS_CHAIN bounce=%u max_hops=%u delay_ms=%u ttl_ms=%lu relayed=%lu dup=%lu expired=%lu\r\n",
+                                g_rns_relay.bounce_test_mode ? 1U : 0U,
+                                (unsigned)g_rns_relay.max_hops,
+                                (unsigned)g_rns_relay.forward_delay_ms,
+                                (unsigned long)g_rns_relay.dedup_window_ms,
+                                (unsigned long)g_rns_relay.relayed_count,
+                                (unsigned long)g_rns_relay.dropped_dup_count,
+                                (unsigned long)g_rns_relay.expired_hop_count);
+            return;
+        }
+        if (strcasecmp(hops_s, "off") == 0 || strcmp(hops_s, "0") == 0) {
+            rns_relay_configure_chain_test(&g_rns_relay, false, 128U, 120U, RNS_DEDUP_WINDOW_MS);
+        } else {
+            uint8_t max_h     = (uint8_t)strtoul(hops_s, NULL, 10);
+            uint16_t delay_ms = delay_s ? (uint16_t)strtoul(delay_s, NULL, 10) : 140U;
+            uint32_t ttl_ms   = ttl_s   ? (uint32_t)strtoul(ttl_s, NULL, 10)   : 3000UL;
+            rns_relay_configure_chain_test(&g_rns_relay, true, max_h, delay_ms, ttl_ms);
+        }
+        hal_usb_uart_printf("OK RNS_CHAIN bounce=%u max_hops=%u delay_ms=%u ttl_ms=%lu\r\n",
+                            g_rns_relay.bounce_test_mode ? 1U : 0U,
+                            (unsigned)g_rns_relay.max_hops,
+                            (unsigned)g_rns_relay.forward_delay_ms,
+                            (unsigned long)g_rns_relay.dedup_window_ms);
+        return;
+    }
+
     if (strcmp(cmd, "rns_form") == 0) {
         char *shape_s = strtok(NULL, " ");
         if (shape_s == NULL) {
@@ -2654,16 +2691,25 @@ int main(void) {
                     rns_relay_should_forward(&g_rns_relay, rx_copy, rx_len, now_ms)) {
                     memcpy(g_relay_tx_buf, rx_copy, rx_len);
                     g_relay_tx_len  = rx_len;
-                    g_relay_due_ms  = now_ms + 120U + (uint32_t)(hal_micros() & 0x7FU);
+                    uint32_t jitter = g_rns_relay.bounce_test_mode ? 0U : (uint32_t)(hal_micros() & 0x7FU);
+                    g_relay_due_ms  = now_ms + (uint32_t)g_rns_relay.forward_delay_ms + jitter;
                     g_relay_pending = true;
                 }
-                hal_usb_uart_printf("RNS_RELAY_RX len=%u rssi=%ddBm snr=%ddB hops=%u ifac=%u fwd=%u\r\n",
+                hal_usb_uart_printf("RNS_RELAY_RX len=%u rssi=%ddBm snr=%ddB hops=%u ifac=%u fwd=%u exp=%u\r\n",
                                     rx_len,
                                     (int)rx_st.rssi_dbm,
                                     (int)(rx_st.snr_q2_db / 4),
                                     orig_hops,
                                     ((rx_copy[0] & 0x80U) != 0U) ? 1U : 0U,
-                                    g_relay_pending ? 1U : 0U);
+                                    g_relay_pending ? 1U : 0U,
+                                    g_rns_relay.last_rx_expired ? 1U : 0U);
+                if (g_rns_relay.last_rx_expired) {
+                    hal_usb_uart_printf("RNS_RELAY_EXPIRED hops=%u max_hops=%u ttl_ms=%lu total_exp=%lu\r\n",
+                                        orig_hops,
+                                        (unsigned)g_rns_relay.max_hops,
+                                        (unsigned long)g_rns_relay.dedup_window_ms,
+                                        (unsigned long)g_rns_relay.expired_hop_count);
+                }
             }
         }
 

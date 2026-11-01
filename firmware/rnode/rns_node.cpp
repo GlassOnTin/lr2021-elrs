@@ -155,6 +155,28 @@ size_t rnode_build_phyprm(uint32_t bw_hz, uint8_t sf, uint16_t preamble_sym,
 void rns_relay_init(rns_relay_table_t *t) {
     if (t == NULL) return;
     memset(t, 0, sizeof(*t));
+    t->max_hops         = 128U;
+    t->forward_delay_ms = 120U;
+    t->dedup_window_ms  = RNS_DEDUP_WINDOW_MS;
+    t->bounce_test_mode = false;
+}
+
+void rns_relay_configure_chain_test(rns_relay_table_t *t,
+                                    bool bounce_enable,
+                                    uint8_t max_hops,
+                                    uint16_t forward_delay_ms,
+                                    uint32_t ttl_window_ms) {
+    if (t == NULL) return;
+    memset(t->ring, 0, sizeof(t->ring));
+    t->head             = 0U;
+    t->bounce_test_mode = bounce_enable;
+    t->max_hops         = (max_hops == 0U || max_hops > 62U) ? (bounce_enable ? 4U : 128U) : max_hops;
+    t->forward_delay_ms = (forward_delay_ms == 0U) ? 120U : forward_delay_ms;
+    t->dedup_window_ms   = (ttl_window_ms == 0UL) ? RNS_DEDUP_WINDOW_MS : ttl_window_ms;
+    t->last_rx_expired   = false;
+    t->relayed_count     = 0U;
+    t->dropped_dup_count = 0U;
+    t->expired_hop_count = 0U;
 }
 
 /* Computes a 64-bit FNV-1a invariant hash over the Reticulum packet:
@@ -179,15 +201,13 @@ uint64_t rns_packet_invariant_hash(const uint8_t *pkt, size_t len) {
     return h;
 }
 
-static bool rns_dedup_contains(const rns_relay_table_t *t, uint64_t hash, uint32_t now_ms) {
+static rns_dedup_entry_t *rns_dedup_find(rns_relay_table_t *t, uint64_t hash) {
     for (uint8_t i = 0U; i < RNS_DEDUP_RING_SIZE; i++) {
         if (t->ring[i].valid && t->ring[i].hash == hash) {
-            if ((uint32_t)(now_ms - t->ring[i].timestamp_ms) <= RNS_DEDUP_WINDOW_MS) {
-                return true;
-            }
+            return &t->ring[i];
         }
     }
-    return false;
+    return NULL;
 }
 
 void rns_relay_record_sent(rns_relay_table_t *t, const uint8_t *pkt, size_t len, uint32_t now_ms) {
@@ -195,37 +215,103 @@ void rns_relay_record_sent(rns_relay_table_t *t, const uint8_t *pkt, size_t len,
         return;
     }
     uint64_t h = rns_packet_invariant_hash(pkt, len);
-    t->ring[t->head].hash         = h;
-    t->ring[t->head].timestamp_ms = now_ms;
-    t->ring[t->head].valid        = true;
-    t->head = (uint8_t)((t->head + 1U) % RNS_DEDUP_RING_SIZE);
+    uint8_t hops = (pkt[1] < 63U) ? pkt[1] : 63U;
+    rns_dedup_entry_t *e = rns_dedup_find(t, h);
+    if (e == NULL) {
+        e = &t->ring[t->head];
+        t->head = (uint8_t)((t->head + 1U) % RNS_DEDUP_RING_SIZE);
+    }
+    e->hash           = h;
+    e->seen_hops_mask = (1ULL << hops);
+    e->timestamp_ms   = now_ms;
+    e->valid          = true;
 }
 
 bool rns_relay_should_forward(rns_relay_table_t *t, uint8_t *inout_pkt, size_t len, uint32_t now_ms) {
     if (t == NULL || inout_pkt == NULL || len < RNS_MIN_PACKET_LEN || len > RNODE_HW_MTU) {
         return false;
     }
+    t->last_rx_expired = false;
+
+    uint8_t max_h = (t->max_hops == 0U) ? 128U : t->max_hops;
+    uint32_t win_ms = (t->dedup_window_ms == 0UL) ? RNS_DEDUP_WINDOW_MS : t->dedup_window_ms;
+    bool is_ifac = (inout_pkt[0] & 0x80U) != 0U;
+    uint8_t in_hops = inout_pkt[1];
 
     uint64_t h = rns_packet_invariant_hash(inout_pkt, len);
-    if (rns_dedup_contains(t, h, now_ms)) {
-        t->dropped_dup_count++;
-        return false;
-    }
+    rns_dedup_entry_t *e = rns_dedup_find(t, h);
 
-    /* If IFAC bit (0x80) is NOT set, increment hop count (up to max 128).
-     * If IFAC bit (0x80) IS set, preserve exact bytes so end-to-end IFAC MAC stays valid.
-     */
-    if ((inout_pkt[0] & 0x80U) == 0U) {
-        if (inout_pkt[1] >= 128U) {
+    if (!t->bounce_test_mode) {
+        if (e != NULL && (uint32_t)(now_ms - e->timestamp_ms) <= win_ms) {
+            t->dropped_dup_count++;
             return false;
         }
-        inout_pkt[1]++;
+        if (!is_ifac) {
+            if (in_hops >= max_h) {
+                t->expired_hop_count++;
+                t->last_rx_expired = true;
+                return false;
+            }
+            inout_pkt[1] = (uint8_t)(in_hops + 1U);
+        }
+        if (e == NULL) {
+            e = &t->ring[t->head];
+            t->head = (uint8_t)((t->head + 1U) % RNS_DEDUP_RING_SIZE);
+        }
+        e->hash           = h;
+        e->seen_hops_mask = (in_hops < 63U) ? (1ULL << in_hops) : 0ULL;
+        e->timestamp_ms   = now_ms;
+        e->valid          = true;
+        t->relayed_count++;
+        return true;
     }
 
-    t->ring[t->head].hash         = h;
-    t->ring[t->head].timestamp_ms = now_ms;
-    t->ring[t->head].valid        = true;
-    t->head = (uint8_t)((t->head + 1U) % RNS_DEDUP_RING_SIZE);
+    /* Multi-hop ping-pong chain test mode:
+     * Allows a packet to bounce back and forth across a short radio chain, incrementing
+     * `hops` on each pass after `forward_delay_ms` until `hops >= max_hops` or `ttl_window_ms` expires.
+     */
+    if (e != NULL) {
+        uint32_t age_ms = (uint32_t)(now_ms - e->timestamp_ms);
+        if (age_ms > win_ms) {
+            if (in_hops > 0U) {
+                /* In-flight bouncing packet exceeded chain TTL expiration window */
+                t->expired_hop_count++;
+                t->last_rx_expired = true;
+                return false;
+            }
+            /* Fresh hops=0 packet after window expiry resets the chain entry */
+            e->seen_hops_mask = 0ULL;
+            e->timestamp_ms   = now_ms;
+        } else if (in_hops < 63U && (e->seen_hops_mask & (1ULL << in_hops)) != 0ULL) {
+            /* Duplicate at the exact same hop level (or our own transmitted hop) */
+            t->dropped_dup_count++;
+            return false;
+        }
+    }
+
+    if (!is_ifac) {
+        if (in_hops >= max_h) {
+            t->expired_hop_count++;
+            t->last_rx_expired = true;
+            return false;
+        }
+        inout_pkt[1] = (uint8_t)(in_hops + 1U);
+    }
+
+    if (e == NULL) {
+        e = &t->ring[t->head];
+        t->head = (uint8_t)((t->head + 1U) % RNS_DEDUP_RING_SIZE);
+        e->hash           = h;
+        e->seen_hops_mask = 0ULL;
+        e->timestamp_ms   = now_ms;
+        e->valid          = true;
+    }
+    if (in_hops < 63U) {
+        e->seen_hops_mask |= (1ULL << in_hops);
+    }
+    if (inout_pkt[1] < 63U) {
+        e->seen_hops_mask |= (1ULL << inout_pkt[1]);
+    }
     t->relayed_count++;
     return true;
 }

@@ -1275,7 +1275,58 @@ static void test_multi_drone_mesh_and_formation(void) {
     assert(brake_cmd.type == RNS_DRONE_CMD_VEL_NED);
     assert(brake_cmd.vx_cms == 0 && brake_cmd.vy_cms == 0 && brake_cmd.vz_cms == 0);
 
-    printf("[PASS] test_multi_drone_mesh_and_formation (RNSF 64B formation + 2-hop relay + MAVLink #84/#86 + brake)\n");
+    /* 3. Verify 2-node multi-hop ping-pong bounce chain with delay and hop/TTL expiration */
+    rns_relay_table_t node_a, node_b;
+    rns_relay_init(&node_a);
+    rns_relay_init(&node_b);
+    rns_relay_configure_chain_test(&node_a, true, 4U, 150U, 1000UL);
+    rns_relay_configure_chain_test(&node_b, true, 4U, 150U, 1000UL);
+
+    fp.seq   = 77U;
+    fp.shape = RNS_FORM_VEE;
+    flen = rns_build_formation_pkt(&fp, form_pkt, sizeof(form_pkt));
+    assert(flen == 64U && form_pkt[1] == 0U);
+
+    /* Node A originates packet at t=100ms (hops=0) */
+    rns_relay_record_sent(&node_a, form_pkt, flen, 100U);
+    /* Node A must NOT re-relay its own hops=0 transmission */
+    assert(!rns_relay_should_forward(&node_a, form_pkt, flen, 105U));
+
+    /* Hop 0 -> 1 on Node B at t=140ms */
+    assert(rns_relay_should_forward(&node_b, form_pkt, flen, 140U));
+    assert(form_pkt[1] == 1U);
+    /* Duplicate at hop 1 on Node B must be dropped */
+    assert(!rns_relay_should_forward(&node_b, form_pkt, flen, 145U));
+
+    /* Hop 1 -> 2 back on Node A at t=300ms */
+    assert(rns_relay_should_forward(&node_a, form_pkt, flen, 300U));
+    assert(form_pkt[1] == 2U);
+
+    /* Hop 2 -> 3 back on Node B at t=460ms */
+    assert(rns_relay_should_forward(&node_b, form_pkt, flen, 460U));
+    assert(form_pkt[1] == 3U);
+
+    /* Hop 3 -> 4 back on Node A at t=620ms */
+    assert(rns_relay_should_forward(&node_a, form_pkt, flen, 620U));
+    assert(form_pkt[1] == 4U);
+
+    /* At t=780ms, Node B receives hops=4 == max_hops(4): MUST EXPIRE! */
+    assert(!rns_relay_should_forward(&node_b, form_pkt, flen, 780U));
+    assert(node_b.last_rx_expired && node_b.expired_hop_count == 1U);
+
+    /* Verify wall-clock TTL expiration (`ttl_window_ms = 500ms`) before `max_hops` is reached */
+    rns_relay_configure_chain_test(&node_a, true, 6U, 200U, 500UL);
+    rns_relay_configure_chain_test(&node_b, true, 6U, 200U, 500UL);
+    fp.seq = 78U;
+    flen = rns_build_formation_pkt(&fp, form_pkt, sizeof(form_pkt));
+    rns_relay_record_sent(&node_a, form_pkt, flen, 1000U);
+    assert(rns_relay_should_forward(&node_b, form_pkt, flen, 1100U)); /* hops 0 -> 1 */
+    assert(rns_relay_should_forward(&node_a, form_pkt, flen, 1350U)); /* hops 1 -> 2 (age 350ms <= 500ms) */
+    /* Next bounce arrives at Node B at t=1650ms (age 550ms > 500ms on Node B): MUST EXPIRE on TTL! */
+    assert(!rns_relay_should_forward(&node_b, form_pkt, flen, 1650U));
+    assert(node_b.last_rx_expired && node_b.expired_hop_count == 1U);
+
+    printf("[PASS] test_multi_drone_mesh_and_formation (RNSF 64B formation + ping-pong hop/TTL chain + MAVLink #84/#86)\n");
 }
 
 int main(void) {

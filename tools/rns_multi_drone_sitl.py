@@ -288,6 +288,22 @@ def main():
         print(
             f"   [PASS] Wingman 1 transitioned to LOITER & braked (Vn={g1_final.vx/100:.2f} m/s, Ve={g1_final.vy/100:.2f} m/s)"
         )
+
+        print("\n6. Testing Multi-Hop Ping-Pong Relay Chain & Hop/TTL Expiration (`rns_chain 4 120 3000`)...")
+        radio_cmd(s_leader, "rns_chain 4 120 3000")
+        radio_cmd(s_wing1, "rns_chain 4 120 3000")
+        s_leader.write(b"rns_form vee 10.0 5.0 0.0 0.0\r\n")
+        time.sleep(0.85)
+        chain_a = s_leader.read_all().decode(errors="replace")
+        chain_b = s_wing1.read_all().decode(errors="replace")
+        assert "hops=1" in chain_a and "hops=3" in chain_a, f"Expected hops=1,3 on Node A, got:\n{chain_a}"
+        assert "hops=0" in chain_b and "hops=2" in chain_b and "RNS_RELAY_EXPIRED hops=4 max_hops=4" in chain_b, (
+            f"Expected hops=0,2,4+EXPIRED on Node B, got:\n{chain_b}"
+        )
+        print("   [PASS] Single RNSF packet bounced 4 hops across both radios (Slots 1..5) and expired cleanly at max_hops=4.")
+        radio_cmd(s_leader, "rns_chain off")
+        radio_cmd(s_wing1, "rns_chain off")
+
         print("\nALL MULTI-DRONE LIVE 868 MHz RF + ANISOPTERA SITL FORMATION CHECKS PASSED.")
 
     finally:

@@ -118,6 +118,7 @@ extern const uint8_t RNS_DEST_DRONE_CMD[16];
 
 typedef struct {
     uint64_t hash;
+    uint64_t seen_hops_mask;
     uint32_t timestamp_ms;
     bool     valid;
 } rns_dedup_entry_t;
@@ -125,11 +126,22 @@ typedef struct {
 typedef struct {
     rns_dedup_entry_t ring[RNS_DEDUP_RING_SIZE];
     uint8_t           head;
+    uint8_t           max_hops;
+    uint16_t          forward_delay_ms;
+    uint32_t          dedup_window_ms;
+    bool              bounce_test_mode;
+    bool              last_rx_expired;
     uint32_t          relayed_count;
     uint32_t          dropped_dup_count;
+    uint32_t          expired_hop_count;
 } rns_relay_table_t;
 
 void rns_relay_init(rns_relay_table_t *t);
+void rns_relay_configure_chain_test(rns_relay_table_t *t,
+                                    bool bounce_enable,
+                                    uint8_t max_hops,
+                                    uint16_t forward_delay_ms,
+                                    uint32_t ttl_window_ms);
 uint64_t rns_packet_invariant_hash(const uint8_t *pkt, size_t len);
 
 /* Returns true if the packet should be relayed and prepares `inout_pkt`
