@@ -63,13 +63,13 @@ Topology B: Reticulum-over-ExpressLRS FHSS Tunnel (Single RF Link for RC + Retic
 ### 2.3 Airborne Store-and-Forward Relay (`RELAY` Mode)
 
 When operating in `RELAY` mode on the drone:
-1. **Invariant Packet Hash Deduplication (`rns_relay_compute_hash()`):** Computes a 32-bit FNV-1a hash over the Reticulum packet while masking out the mutable `hops` byte (`pkt[1]`) on unauthenticated frames. Stores the hash and reception timestamp in a 64-entry ring buffer with a 10,000 ms suppression window (`RNS_RELAY_DEDUP_WINDOW_MS`) so the relay never re-broadcasts its own echo or loops packets.
-2. **IFAC (Interface Authentication Code) Preservation:** If bit 7 of the header flags (`pkt[0] & 0x80`) is set, the relay forwards the packet **without modifying `pkt[1]`**, preserving the cryptographic IFAC tag across the hop. If `IFAC == 0`, the relay increments `pkt[1]` (`hops++`) up to `RNS_MAX_HOPS` (`128`).
+1. **Invariant Packet Hash Deduplication (`rns_relay_compute_hash()`):** Computes a 32-bit FNV-1a hash over the Reticulum packet while masking out the mutable `hops` byte (`pkt[1]`) on unauthenticated frames. Stores the hash and reception timestamp in a 64-entry ring buffer with a 10,000 ms suppression window (`RNS_RELAY_DEDUP_WINDOW_MS`). This prevents the relay from re-broadcasting its own echo or looping packets.
+2. **IFAC (Interface Authentication Code) Preservation:** If bit 7 of the header flags (`pkt[0] & 0x80`) is set, the relay forwards the packet **without modifying `pkt[1]`**. This preserves the cryptographic IFAC tag across the hop. If `IFAC == 0`, the relay increments `pkt[1]` (`hops++`) up to `RNS_MAX_HOPS` (`128`).
 
 ### 2.4 Flight Controller MAVLink v2 Bridge & Telemetry Beacons
 
 - **Downlink Telemetry Beacons (`rnlog.beacon`, Destination Hash `18bcd8a3dea16ef6765c6b27d008d220`):**
-  A zero-dependency streaming MAVLink v1/v2 parser (`rns_mav_parser_feed_byte()`) decodes `HEARTBEAT` (`#0`), `SYS_STATUS` (`#1`), and `GLOBAL_POSITION_INT` (`#33`) from the `TMotorH743` flight controller and formats compact Reticulum broadcast packets:
+  A zero-dependency streaming MAVLink v1/v2 parser (`rns_mav_parser_feed_byte()`) decodes `HEARTBEAT` (`#0`), `SYS_STATUS` (`#1`), and `GLOBAL_POSITION_INT` (`#33`) from the `TMotorH743` flight controller. It formats compact Reticulum broadcast packets:
   ```json
   {"src":"lr2021-drone","lat":0.00000,"lon":0.00000,"alt_m":120,"vbatt_mv":24800,"mode":0,"armed":0,"lq":100,"rssi":-95}
   ```
@@ -105,7 +105,7 @@ For `"lr2021-elrs-demo"`, `UID = 0A:B7:0C:7C:38:03`:
 
 ### 3.2 Hamming(7,4) FEC & Bit Interleaver (`2G4_K1000` / `900_K1000`)
 
-In `2G4_K1000` and `900_K1000` (8-byte `OTA4` frame over GFSK), the 8-byte payload is encoded into 14 air bytes using systematic Hamming(7,4) with a bit interleaver (`fec_encode_8_to_14()` / `fec_decode_14_to_8()` in `firmware/radio/lr2021_driver.cpp`):
-1. Each byte's low and high nibbles (`n0..n15`) are mapped through `k_hamming_enc[16]` into sixteen 7-bit codewords.
-2. Bits `0..6` across groups of 8 codewords are transposed into 14 interleaved air bytes so a burst error of up to 8 consecutive air bits flips at most 1 bit in any single 7-bit codeword.
+In `2G4_K1000` and `900_K1000`, the 8-byte payload of an 8-byte `OTA4` frame over GFSK encodes into 14 air bytes. This uses systematic Hamming(7,4) with a bit interleaver (`fec_encode_8_to_14()` / `fec_decode_14_to_8()` in `firmware/radio/lr2021_driver.cpp`):
+1. The low and high nibbles of each byte (`n0..n15`) map through `k_hamming_enc[16]` into sixteen 7-bit codewords.
+2. Bits `0..6` across groups of 8 codewords transpose into 14 interleaved air bytes. A burst error of up to 8 consecutive air bits flips at most 1 bit in any single 7-bit codeword.
 3. On receive, `fec_decode_14_to_8()` de-interleaves the 14 air bytes and corrects single-bit errors per codeword via `k_hamming_dec[128]`.

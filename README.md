@@ -35,7 +35,7 @@ See [docs/HARDWARE_AND_PROTOCOL.md](docs/HARDWARE_AND_PROTOCOL.md) for hardware 
 
 - **MCU Board:** Seeed Studio XIAO nRF54L15 (`nRF54L15-QFAA`, ARM Cortex-M33 @ 128 MHz, 1.5 MB RRAM, 256 KB SRAM)
 - **Radio Expansion Board:** Seeed Studio Wio-LR2021 (`LR2021EVK1XBS1_XIAO`, Semtech LR2021 rev B silicon `0x0118`)
-- **Oscillator:** Passive 32 MHz crystal (`has_tcxo = false`). Do not send `SET_TCXO_MODE` (`0x0120`) on this board; doing so disables the passive crystal oscillator and raises `HF_XOSC_START_ERR` (`0x0001`).
+- **Oscillator:** Passive 32 MHz crystal (`has_tcxo = false`). Do not send `SET_TCXO_MODE` (`0x0120`) on this board. It disables the passive crystal oscillator and raises `HF_XOSC_START_ERR` (`0x0001`).
 - **RF Input Limit:** Maximum +10 dBm at the SMA ports (`ANT_LF` and `ANT_HF`). Attach antennas before transmitting.
 
 | Function | XIAO Pin | nRF54L15 GPIO | Peripheral / Notes |
@@ -53,8 +53,6 @@ See [docs/HARDWARE_AND_PROTOCOL.md](docs/HARDWARE_AND_PROTOCOL.md) for hardware 
 | `CRSF_RX` / `FC_RX` | `D7` (Grove RX) | `P2.07` | `UARTE21` @ 420000 / 115200 8N1 (from FC TX or Handset) |
 | `USER_LED` | Built-in | `P2.00` | Active-low status LED |
 | `USR_BTN` | Built-in | `P0.00` | Active-low user button |
-
----
 
 ## Build, Test & Flash
 
@@ -183,14 +181,19 @@ python3 tools/rns_sideband_bridge.py both \
     --freq 867200000 --bw 125000 --sf 7 --cr 5 --txpower 14
 ```
 
----
-
 ## Measured Hardware Verification
 
 Tested on two `LR2021EVK1XBS1_XIAO` boards (`FC6D1A37` and `D56B6941`), a live **ArduPilot `TMotorH743` flight controller** (`/dev/ttyACM4`), **Sideband v1.9.8** (`io.unsigned.sideband`) on Android (`127.0.0.1`), and a live **RadioMaster TX16SMK3 ↔ RadioMaster XR4 (`2× LR1121`)** ExpressLRS link (`lr2021-elrs-demo`, `UID = 0A:B7:0C:7C:38:03`):
 
 1. **Closed-Loop 867.2 MHz UK Sub-GHz `RNODE` KISS TNC ↔ Airborne `RELAY` ↔ Live `TMotorH743` Flight Controller:**
-   - Verified full RNode KISS handshake (`CMD_DETECT=0x46`, `CMD_STAT_PHYPRM=040003d00012001300020006`, `CMD_READY=0x01`), live `TMotorH743` MAVLink v2 `HEARTBEAT` (`#0`) + `SYS_STATUS` (`#1`, `16,019 mV` 4S LiPo) + `GLOBAL_POSITION_INT` (`#33`) ingestion, over-the-air `rnlog.beacon` JSON reception (`rssi=-95 dBm`, `snr=+14.25 dB`), unmasked Reticulum packet store-and-forward (`hops: 0 -> 1`), 64-entry FNV-1a duplicate suppression (`relay_drop=1`), byte-for-byte IFAC packet preservation (`ifac=1`), and closed-loop execution of `LOITER`, `RTL`, `LAND`, `MODE 2`, `GOTO 0 0 85`, `ARM`, `DISARM`, and `MODE 0` on the live `TMotorH743` (`COMMAND_ACK result=0`, `MISSION_ACK`, and `HEARTBEAT.custom_mode` transitions `0 -> 5 -> 6 -> 9 -> 2 -> 0`):
+   - Verified full RNode KISS handshake (`CMD_DETECT=0x46`, `CMD_STAT_PHYPRM=040003d00012001300020006`, `CMD_READY=0x01`).
+   - Verified live `TMotorH743` MAVLink v2 ingestion: `HEARTBEAT` (`#0`), `SYS_STATUS` (`#1`, `16,019 mV` 4S LiPo), and `GLOBAL_POSITION_INT` (`#33`).
+   - Verified over-the-air `rnlog.beacon` JSON reception (`rssi=-95 dBm`, `snr=+14.25 dB`).
+   - Verified unmasked Reticulum packet store-and-forward (`hops: 0 -> 1`).
+   - Verified 64-entry FNV-1a duplicate suppression (`relay_drop=1`).
+   - Verified byte-for-byte IFAC packet preservation (`ifac=1`).
+   - Verified closed-loop execution of `LOITER`, `RTL`, `LAND`, `MODE 2`, `GOTO 0 0 85`, `ARM`, `DISARM`, and `MODE 0` on the live `TMotorH743`.
+   - Verified `COMMAND_ACK result=0`, `MISSION_ACK`, and `HEARTBEAT.custom_mode` transitions `0 -> 5 -> 6 -> 9 -> 2 -> 0`.
    ```text
    [RELAY] RNS_CMD_RX src=LORA hops=0 cmd="LOITER" type=2 mav_len=45 mav_hex=FD21000000FFBE4C00000000000000000000000000000000000000000000000000000000000011000101008AB3
    [TMotorH743 COMMAND_ACK] COMMAND_ACK {command : 17, result : 0, progress : 0, result_param2 : 0, target_system : 255, target_component : 190}
@@ -198,7 +201,7 @@ Tested on two `LR2021EVK1XBS1_XIAO` boards (`FC6D1A37` and `D56B6941`), a live *
    [RELAY BCN] OK RNS_BCN_TX sent=1 len=136 json={"src":"lr2021-drone","lat":0.00000,"lon":0.00000,"alt_m":-1,"vbatt_mv":16011,"mode":5,"armed":0,"lq":100,"rssi":-95}
    ```
 2. **Closed-Loop Bidirectional Reticulum-over-ExpressLRS FHSS Tunnel (`ELRS_PKT_TYPE_DATA` on `EU868 900_200HZ` and `CE_LBT 2G4_K1000`) ↔ Live `TMotorH743`:**
-   - Verified 100% fragmentation and reassembly of both uplink `elrs.drone.cmd` (`MODE 5`, `RTL`, `LAND`, `GOTO 0 0 85`, `RC 1620 1380 1050 1510`, `RC 0 0 0 0`, `MODE 0`) and 135-byte downlink `rnlog.beacon` Reticulum packets across `OTA4` (`8 B`) frames on `EU868 900_200HZ` and `CE_LBT 2G4_K1000` (`2,882 / 2,883 = 99.97%` uplink CRC, `988 / 988 = 100%` downlink telemetry CRC), including live `RC_CHANNELS_OVERRIDE` (`#70`) and `COMMAND_ACK` (`result=0`) on `TMotorH743`:
+   - Verified 100% fragmentation and reassembly of uplink `elrs.drone.cmd` (`MODE 5`, `RTL`, `LAND`, `GOTO 0 0 85`, `RC 1620 1380 1050 1510`, `RC 0 0 0 0`, `MODE 0`) and 135-byte downlink `rnlog.beacon` Reticulum packets across `OTA4` (`8 B`) frames on `EU868 900_200HZ` and `CE_LBT 2G4_K1000` (`2,882 / 2,883 = 99.97%` uplink CRC, `988 / 988 = 100%` downlink telemetry CRC), including live `RC_CHANNELS_OVERRIDE` (`#70`) and `COMMAND_ACK` (`result=0`) on `TMotorH743`:
    ```text
    ELRS_RNS_RX len=135 hops=0 hex=080018BCD8A3DEA16EF6765C6B27D008D220007B22737263223A226C72323032...
    RNS_BCN_RX src=ELRS_TUNNEL hops=0 len=135 json={"src":"lr2021-drone","lat":0.00000,"lon":0.00000,"alt_m":0,"vbatt_mv":16018,"mode":6,"armed":0,"lq":100,"rssi":-95}
@@ -206,8 +209,8 @@ Tested on two `LR2021EVK1XBS1_XIAO` boards (`FC6D1A37` and `D56B6941`), a live *
    [TMotorH743 RC_CHANNELS] ch1=1620 ch2=1380 ch3=1050 ch4=1510 rssi=255
    ```
 3. **End-to-End Official Reticulum (`RNS 1.5.7` `RNodeInterface`) & Sideband (`io.unsigned.sideband` v1.9.8) ↔ 867.2 MHz LoRa RF ↔ Live `TMotorH743`:**
-   - Verified transparent `RNODE_HW_MTU = 508` multi-frame LoRa fragmentation/reassembly (`<= 250 B` physical LoRa payloads with `0xFE 0xCA` framing) and non-blocking `BASEPRI` SPI critical sections so `UARTE22` / `UARTE21` RX interrupts never drop bytes during `CALIBRATE_FRONTEND`.
-   - Verified live Sideband announce discovery (`LR2021 Drone (TMotorH743) <dbe84551c59b392f43632c2982e3c6a4>`), `RNS.Link` establishment (`500 B` link MTU, `RTT = 560 ms`, `RSSI = -96 dBm`, `SNR = +14.25 dB`), bidirectional LXMF command execution (`rtl` and `mode 0` returning `ACK = 0`), quadcopter icon appearance (`FIELD_ICON_APPEARANCE`), and Sideband Telemetry screen rendering (`1024.17 mbar`, `38.5 °C`, `78.2%` / `16.01 V` battery, `Mode: RTL (6)`):
+   - Verified transparent `RNODE_HW_MTU = 508` multi-frame LoRa fragmentation and reassembly. Physical LoRa payloads are `<= 250 B` with `0xFE 0xCA` framing. Non-blocking `BASEPRI` SPI critical sections prevent `UARTE22` / `UARTE21` RX interrupts from dropping bytes during `CALIBRATE_FRONTEND`.
+   - Verified live Sideband announce discovery (`LR2021 Drone (TMotorH743) <dbe84551c59b392f43632c2982e3c6a4>`). Established `RNS.Link` with `500 B` link MTU, `RTT = 560 ms`, `RSSI = -96 dBm`, and `SNR = +14.25 dB`. Executed bidirectional LXMF commands (`rtl` and `mode 0`) and received `ACK = 0`. Confirmed quadcopter icon appearance (`FIELD_ICON_APPEARANCE`). Rendered Sideband Telemetry screen showing `1024.17 mbar`, `38.5 °C`, `78.2%` / `16.01 V` battery, and `Mode: RTL (6)`.
 
    | Announce Discovery (`867.2 MHz`) | Contact & Quadcopter Icon | Bidirectional `rtl` -> `TMotorH743` | Live `TMotorH743` Telemetry |
    | :---: | :---: | :---: | :---: |
