@@ -1,6 +1,6 @@
 # Hardware & Protocol Architecture
 
-This document covers the hardware interface on the Seeed Studio Semtech LR2021 LoRa Plus Evaluation Kit (`LR2021EVK1XBS1_XIAO`), the Semtech LR2021 Rev B (`0x0118`) initialization sequence, the ExpressLRS OTA4/OTA8 packet and FHSS engines, the Reticulum `RNode` KISS / airborne relay / MAVLink bridge / ExpressLRS `DATA` tunnel architecture, and the USB CDC CLI protocol.
+This document covers the hardware interface on the [Seeed Studio Semtech LR2021 LoRa Plus Evaluation Kit](https://www.seeedstudio.com/LR2021-LoRa-Plus-Evaluation-kit-868Mhz-EU-V2-0-p-6697.html) ([915 MHz US](https://www.seeedstudio.com/LR2021-LoRa-Plus-Evaluation-kit-915Mhz-US-V2-0-p-6698.html) / [Seeed Wiki](https://wiki.seeedstudio.com/semtech_lr2021_evk_getting_started/), `LR2021EVK1XBS1_XIAO`), the Semtech LR2021 Rev B (`0x0118`) initialization sequence, the ExpressLRS OTA4/OTA8 packet and FHSS engines, the Reticulum `RNode` KISS / airborne relay / MAVLink bridge / ExpressLRS `DATA` tunnel architecture, and the USB CDC CLI protocol.
 
 ---
 

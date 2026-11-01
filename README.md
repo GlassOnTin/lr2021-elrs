@@ -1,6 +1,6 @@
 # lr2021-elrs
 
-Bare-metal ExpressLRS v3/v4 transceiver (`ELRS_TX`, `ELRS_RX`), passive over-the-air packet monitor (`MONITOR`), raw FLRC packet bridge (`BRIDGE`), Reticulum `RNode` KISS TNC (`RNODE`), and airborne Reticulum mesh repeater + MAVLink flight-controller bridge (`RELAY`) firmware for the Seeed Studio Semtech LR2021 LoRa Plus Evaluation Kit (`Seeed Studio XIAO nRF54L15` + `Wio-LR2021`).
+Bare-metal ExpressLRS v3/v4 transceiver (`ELRS_TX`, `ELRS_RX`), passive over-the-air packet monitor (`MONITOR`), raw FLRC packet bridge (`BRIDGE`), Reticulum `RNode` KISS TNC (`RNODE`), and airborne Reticulum mesh repeater + MAVLink flight-controller bridge (`RELAY`) firmware for the [Seeed Studio Semtech LR2021 LoRa Plus Evaluation Kit](https://www.seeedstudio.com/LR2021-LoRa-Plus-Evaluation-kit-868Mhz-EU-V2-0-p-6697.html) ([915 MHz US](https://www.seeedstudio.com/LR2021-LoRa-Plus-Evaluation-kit-915Mhz-US-V2-0-p-6698.html) / [Seeed Wiki](https://wiki.seeedstudio.com/semtech_lr2021_evk_getting_started/), `Seeed Studio XIAO nRF54L15` + `Wio-LR2021`).
 
 ## Features
 
@@ -33,8 +33,9 @@ See [docs/HARDWARE_AND_PROTOCOL.md](docs/HARDWARE_AND_PROTOCOL.md) for hardware 
 
 ## Hardware Target & Pin Mapping
 
+- **Evaluation Kit:** [Seeed Studio Semtech LR2021 LoRa Plus Evaluation Kit (868 MHz EU)](https://www.seeedstudio.com/LR2021-LoRa-Plus-Evaluation-kit-868Mhz-EU-V2-0-p-6697.html) / [915 MHz US](https://www.seeedstudio.com/LR2021-LoRa-Plus-Evaluation-kit-915Mhz-US-V2-0-p-6698.html) ([Getting Started Wiki](https://wiki.seeedstudio.com/semtech_lr2021_evk_getting_started/))
 - **MCU Board:** Seeed Studio XIAO nRF54L15 (`nRF54L15-QFAA`, ARM Cortex-M33 @ 128 MHz, 1.5 MB RRAM, 256 KB SRAM)
-- **Radio Expansion Board:** Seeed Studio Wio-LR2021 (`LR2021EVK1XBS1_XIAO`, Semtech LR2021 rev B silicon `0x0118`)
+- **Radio Expansion Board:** [Seeed Studio Wio-LR2021](https://www.seeedstudio.com/Seeed-Studio-Wio-LR2021-Wireless-module-868-915MHz-Tape-reel-p-6831.html) (`LR2021EVK1XBS1_XIAO`, Semtech LR2021 rev B silicon `0x0118`)
 - **Oscillator:** Passive 32 MHz crystal (`has_tcxo = false`). Do not send `SET_TCXO_MODE` (`0x0120`) on this board. It disables the passive crystal oscillator and raises `HF_XOSC_START_ERR` (`0x0001`).
 - **RF Input Limit:** Maximum +10 dBm at the SMA ports (`ANT_LF` and `ANT_HF`). Attach antennas before transmitting.
 
