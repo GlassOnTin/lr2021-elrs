@@ -7,6 +7,7 @@
 #include "rns_node.h"
 #include "../elrs/elrs_protocol.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -519,6 +520,31 @@ bool rns_parse_drone_command_pkt(const uint8_t *pkt, size_t len, rns_drone_cmd_t
         out_cmd->type = RNS_DRONE_CMD_RC_OVERRIDE;
         return true;
     }
+    if (strncmp(buf, "VEL ", 4) == 0 || strncmp(buf, "BVL ", 4) == 0) {
+        bool is_body = (buf[0] == 'B');
+        const char *p = buf + 4;
+        char *endp = NULL;
+        long vx = strtol(p, &endp, 10);
+        if (endp == p) return false;
+        p = endp;
+        long vy = strtol(p, &endp, 10);
+        if (endp == p) return false;
+        p = endp;
+        long vz = strtol(p, &endp, 10);
+        if (endp == p) return false;
+        p = endp;
+        out_cmd->type           = RNS_DRONE_CMD_VEL_NED;
+        out_cmd->vx_cms         = (int16_t)vx;
+        out_cmd->vy_cms         = (int16_t)vy;
+        out_cmd->vz_cms         = (int16_t)vz;
+        out_cmd->use_body_frame = is_body;
+        long yr = strtol(p, &endp, 10);
+        if (endp != p) {
+            out_cmd->yaw_rate_cdps = (int16_t)yr;
+            out_cmd->has_yaw_rate  = true;
+        }
+        return true;
+    }
     return false;
 }
 
@@ -555,7 +581,7 @@ size_t rns_build_mavlink_command(const rns_drone_cmd_t *cmd, uint8_t seq, uint8_
         return 0U;
     }
 
-    uint8_t payload[37];
+    uint8_t payload[56];
     memset(payload, 0, sizeof(payload));
     uint8_t pay_len   = 0U;
     uint32_t msg_id   = 0UL;
@@ -617,6 +643,46 @@ size_t rns_build_mavlink_command(const rns_drone_cmd_t *cmd, uint8_t seq, uint8_
         }
         payload[16] = 1U; /* target_system = 1 */
         payload[17] = 1U; /* target_component = 1 */
+    } else if (cmd->type == RNS_DRONE_CMD_VEL_NED) {
+        /* MAVLINK_MSG_ID_SET_POSITION_TARGET_LOCAL_NED (84, len=53, CRC_EXTRA=143)
+         * Matches Anisoptera sim/mav_common.py:
+         *   mask 0x0DC7 (velocity only) or 0x05C7 (velocity + yaw_rate)
+         *   frame MAV_FRAME_BODY_OFFSET_NED (9) or MAV_FRAME_LOCAL_NED (1)
+         */
+        if (max_len < 65U) return 0U;
+        msg_id    = 84UL;
+        pay_len   = 53U;
+        crc_extra = 143U;
+        write_f32_le(&payload[16], (float)cmd->vx_cms * 0.01f);
+        write_f32_le(&payload[20], (float)cmd->vy_cms * 0.01f);
+        write_f32_le(&payload[24], (float)cmd->vz_cms * 0.01f);
+        if (cmd->has_yaw_rate) {
+            write_f32_le(&payload[44], ((float)cmd->yaw_rate_cdps * 0.01f) * 0.0174532925f);
+        }
+        uint16_t mask = cmd->has_yaw_rate ? 0x05C7U : 0x0DC7U;
+        write_u16_le(&payload[48], mask);
+        payload[50] = 1U; /* target_system = 1 */
+        payload[51] = 1U; /* target_component = 1 */
+        payload[52] = cmd->use_body_frame ? 9U : 1U; /* BODY_OFFSET_NED (9) or LOCAL_NED (1) */
+    } else if (cmd->type == RNS_DRONE_CMD_GLOBAL_POS_VEL) {
+        /* MAVLINK_MSG_ID_SET_POSITION_TARGET_GLOBAL_INT (86, len=53, CRC_EXTRA=5)
+         * Pos + NED velocity feed-forward + heading in MAV_FRAME_GLOBAL_RELATIVE_ALT_INT (6)
+         */
+        if (max_len < 65U) return 0U;
+        msg_id    = 86UL;
+        pay_len   = 53U;
+        crc_extra = 5U;
+        write_u32_le(&payload[4],  (uint32_t)cmd->lat_deg_e7);
+        write_u32_le(&payload[8],  (uint32_t)cmd->lon_deg_e7);
+        write_f32_le(&payload[12], (float)cmd->alt_m);
+        write_f32_le(&payload[16], (float)cmd->vx_cms * 0.01f);
+        write_f32_le(&payload[20], (float)cmd->vy_cms * 0.01f);
+        write_f32_le(&payload[24], (float)cmd->vz_cms * 0.01f);
+        write_f32_le(&payload[40], ((float)cmd->heading_cdeg * 0.01f) * 0.0174532925f);
+        write_u16_le(&payload[48], 0x09C0U); /* Use Pos + Vel + Yaw (ignore accel + yaw_rate) */
+        payload[50] = 1U; /* target_system = 1 */
+        payload[51] = 1U; /* target_component = 1 */
+        payload[52] = 6U; /* MAV_FRAME_GLOBAL_RELATIVE_ALT_INT */
     } else {
         return 0U;
     }
@@ -1273,3 +1339,158 @@ bool rns_parse_targeted_cmd_pkt(const uint8_t *pkt,
     }
     return true;
 }
+
+/* ---------------------------------------------------------------------------
+ * 6. Multi-Drone Formation & Mesh Control Distribution ("RNSF" context 0xA7)
+ * --------------------------------------------------------------------------- */
+size_t rns_build_formation_pkt(const rns_formation_pkt_t *fp,
+                               uint8_t *out_pkt,
+                               size_t max_len) {
+    if (fp == NULL || out_pkt == NULL || max_len < 64U) {
+        return 0U;
+    }
+    memset(out_pkt, 0, 64U);
+    out_pkt[0] = 0x08U; /* HEADER_1 | BROADCAST | PLAIN | DATA */
+    out_pkt[1] = 0x00U; /* hops = 0 */
+    memcpy(&out_pkt[2], RNS_DEST_DRONE_CMD, 16U);
+    out_pkt[18] = 0xA7U; /* Formation context */
+
+    memcpy(&out_pkt[19], "RNSF", 4U);
+    memcpy(&out_pkt[23], fp->leader_dest, 16U);
+    out_pkt[39] = fp->seq;
+    out_pkt[40] = fp->shape;
+    write_u16_le(&out_pkt[41], fp->spacing_dm);
+    write_u32_le(&out_pkt[43], (uint32_t)fp->leader_lat_e7);
+    write_u32_le(&out_pkt[47], (uint32_t)fp->leader_lon_e7);
+    write_u32_le(&out_pkt[51], (uint32_t)fp->leader_alt_mm);
+    write_u16_le(&out_pkt[55], (uint16_t)fp->vx_cms);
+    write_u16_le(&out_pkt[57], (uint16_t)fp->vy_cms);
+    write_u16_le(&out_pkt[59], (uint16_t)fp->vz_cms);
+    /* Store heading in [61] as 2-deg steps or use [59..60] if needed; wait:
+     * Let's store leader_alt_dm in 2B [51..52] (0.1m units from leader_alt_mm / 100),
+     * vx_cms [53..54], vy_cms [55..56], vz_cms [57..58], heading_cdeg [59..60]!
+     */
+    int16_t alt_dm = (int16_t)(fp->leader_alt_mm / 100);
+    write_u16_le(&out_pkt[51], (uint16_t)alt_dm);
+    write_u16_le(&out_pkt[53], (uint16_t)fp->vx_cms);
+    write_u16_le(&out_pkt[55], (uint16_t)fp->vy_cms);
+    write_u16_le(&out_pkt[57], (uint16_t)fp->vz_cms);
+    write_u16_le(&out_pkt[59], fp->heading_cdeg);
+    out_pkt[61] = 0U;
+
+    /* 2-byte SHA-256 integrity tag over [2..61] (excludes hop count at [1] so relays can increment hops) */
+    uint8_t digest[32];
+    rns_sha256(&out_pkt[2], 60U, digest);
+    out_pkt[62] = digest[0];
+    out_pkt[63] = digest[1];
+    return 64U;
+}
+
+bool rns_parse_formation_pkt(const uint8_t *pkt,
+                             size_t len,
+                             rns_formation_pkt_t *out_fp) {
+    if (pkt == NULL || out_fp == NULL || len < 64U) {
+        return false;
+    }
+    if (pkt[18] != 0xA7U || memcmp(&pkt[19], "RNSF", 4U) != 0 ||
+        memcmp(&pkt[2], RNS_DEST_DRONE_CMD, 16U) != 0) {
+        return false;
+    }
+    uint8_t digest[32];
+    rns_sha256(&pkt[2], 60U, digest);
+    if (pkt[62] != digest[0] || pkt[63] != digest[1]) {
+        return false;
+    }
+
+    memset(out_fp, 0, sizeof(*out_fp));
+    memcpy(out_fp->leader_dest, &pkt[23], 16U);
+    out_fp->seq           = pkt[39];
+    out_fp->shape         = pkt[40];
+    out_fp->spacing_dm    = read_u16_le(&pkt[41]);
+    out_fp->leader_lat_e7 = (int32_t)read_u32_le(&pkt[43]);
+    out_fp->leader_lon_e7 = (int32_t)read_u32_le(&pkt[47]);
+    out_fp->leader_alt_mm = (int32_t)((int16_t)read_u16_le(&pkt[51])) * 100L;
+    out_fp->vx_cms        = (int16_t)read_u16_le(&pkt[53]);
+    out_fp->vy_cms        = (int16_t)read_u16_le(&pkt[55]);
+    out_fp->vz_cms        = (int16_t)read_u16_le(&pkt[57]);
+    out_fp->heading_cdeg  = read_u16_le(&pkt[59]);
+    return true;
+}
+
+bool rns_compute_formation_slot_cmd(const rns_formation_pkt_t *fp,
+                                    uint8_t slot_id,
+                                    rns_drone_cmd_t *out_cmd) {
+    if (fp == NULL || out_cmd == NULL) {
+        return false;
+    }
+    memset(out_cmd, 0, sizeof(*out_cmd));
+
+    if (fp->shape == RNS_FORM_HOLD_BRAKE) {
+        /* Immediate zero-velocity brake in body/NED frame */
+        out_cmd->type           = RNS_DRONE_CMD_VEL_NED;
+        out_cmd->vx_cms         = 0;
+        out_cmd->vy_cms         = 0;
+        out_cmd->vz_cms         = 0;
+        out_cmd->yaw_rate_cdps  = 0;
+        out_cmd->has_yaw_rate   = false;
+        out_cmd->use_body_frame = true;
+        return true;
+    }
+
+    /* Compute slot offset in Leader body frame (x_fwd_m, y_right_m) */
+    float spacing_m = (float)fp->spacing_dm * 0.1f;
+    float x_fwd_m   = 0.0f;
+    float y_right_m = 0.0f;
+
+    if (slot_id > 0U) {
+        uint8_t rank = (uint8_t)((slot_id + 1U) / 2U);
+        float side   = ((slot_id & 1U) != 0U) ? -1.0f : +1.0f; /* odd=left (-Y), even=right (+Y) */
+
+        switch (fp->shape) {
+            case RNS_FORM_VEE:
+                x_fwd_m   = -(float)rank * spacing_m;
+                y_right_m = side * (float)rank * spacing_m;
+                break;
+            case RNS_FORM_LINE_ABREAST:
+                x_fwd_m   = 0.0f;
+                y_right_m = side * (float)rank * spacing_m;
+                break;
+            case RNS_FORM_COLUMN:
+            default:
+                x_fwd_m   = -(float)slot_id * spacing_m;
+                y_right_m = 0.0f;
+                break;
+        }
+    }
+
+    /* Rotate body offset (x_fwd_m, y_right_m) by leader heading into NED (offset_n_m, offset_e_m) */
+    float hdg_rad = ((float)fp->heading_cdeg * 0.01f) * (3.1415926535f / 180.0f);
+    float cos_h   = cosf(hdg_rad);
+    float sin_h   = sinf(hdg_rad);
+
+    float offset_n_m = x_fwd_m * cos_h - y_right_m * sin_h;
+    float offset_e_m = x_fwd_m * sin_h + y_right_m * cos_h;
+
+    /* Convert NED meters to degE7:
+     * 1 deg latitude ~= 111,319.5 m -> 1 m ~= 89.8315 degE7
+     * 1 deg longitude ~= 111,319.5 * cos(lat) m
+     */
+    float lat_rad = ((float)fp->leader_lat_e7 * 1e-7f) * (3.1415926535f / 180.0f);
+    float cos_lat = cosf(lat_rad);
+    if (cos_lat < 0.1f) {
+        cos_lat = 0.1f;
+    }
+    int32_t dlat_e7 = (int32_t)(offset_n_m * 89.831528f);
+    int32_t dlon_e7 = (int32_t)((offset_e_m * 89.831528f) / cos_lat);
+
+    out_cmd->type         = RNS_DRONE_CMD_GLOBAL_POS_VEL;
+    out_cmd->lat_deg_e7   = fp->leader_lat_e7 + dlat_e7;
+    out_cmd->lon_deg_e7   = fp->leader_lon_e7 + dlon_e7;
+    out_cmd->alt_m        = fp->leader_alt_mm / 1000L;
+    out_cmd->vx_cms       = fp->vx_cms;
+    out_cmd->vy_cms       = fp->vy_cms;
+    out_cmd->vz_cms       = fp->vz_cms;
+    out_cmd->heading_cdeg = fp->heading_cdeg;
+    return true;
+}
+

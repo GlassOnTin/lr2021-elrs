@@ -170,7 +170,9 @@ typedef enum {
     RNS_DRONE_CMD_RC_OVERRIDE,
     RNS_DRONE_CMD_SET_MODE,
     RNS_DRONE_CMD_ARM,
-    RNS_DRONE_CMD_DISARM
+    RNS_DRONE_CMD_DISARM,
+    RNS_DRONE_CMD_VEL_NED,        /* SET_POSITION_TARGET_LOCAL_NED (#84, velocity + optional yaw_rate) */
+    RNS_DRONE_CMD_GLOBAL_POS_VEL  /* SET_POSITION_TARGET_GLOBAL_INT (#86, formation lat/lon/alt + NED vel) */
 } rns_drone_cmd_type_t;
 
 typedef struct {
@@ -180,7 +182,38 @@ typedef struct {
     int32_t              alt_m;
     uint16_t             rc_us[4];
     uint8_t              mode_num;
+    int16_t              vx_cms;
+    int16_t              vy_cms;
+    int16_t              vz_cms;
+    int16_t              yaw_rate_cdps;
+    uint16_t             heading_cdeg;
+    bool                 has_yaw_rate;
+    bool                 use_body_frame;
 } rns_drone_cmd_t;
+
+/* Multi-drone formation geometry & 64B signed Reticulum formation packet (RNSF, context 0xA7) */
+typedef enum {
+    RNS_FORM_HOLD         = 0,
+    RNS_FORM_HOLD_BRAKE   = 0,
+    RNS_FORM_LINE_ABREAST = 1,
+    RNS_FORM_ECHELON_VEE  = 2,
+    RNS_FORM_VEE          = 2,
+    RNS_FORM_COLUMN       = 3
+} rns_formation_shape_t;
+
+typedef struct {
+    uint8_t  leader_dest[16];
+    uint8_t  seq;
+    uint8_t  shape;           /* rns_formation_shape_t */
+    uint16_t spacing_dm;      /* Inter-drone spacing in 0.1 m units (e.g. 100 = 10.0 m) */
+    int32_t  leader_lat_e7;   /* Leader latitude * 1e7 */
+    int32_t  leader_lon_e7;   /* Leader longitude * 1e7 */
+    int32_t  leader_alt_mm;   /* Leader relative altitude above home in mm */
+    int16_t  vx_cms;          /* Leader North velocity in cm/s */
+    int16_t  vy_cms;          /* Leader East velocity in cm/s */
+    int16_t  vz_cms;          /* Leader Down velocity in cm/s */
+    uint16_t heading_cdeg;    /* Leader heading in centi-degrees (0..35999) */
+} rns_formation_pkt_t;
 
 /* Lightweight streaming MAVLink v1/v2 parser state */
 typedef struct {
@@ -386,6 +419,20 @@ bool rns_parse_targeted_cmd_pkt(const uint8_t *pkt,
                                 uint8_t *out_seq,
                                 char *out_cmd_str,
                                 size_t max_cmd_str);
+
+/* Build & parse 64-byte signed Reticulum multi-drone formation packet (RNSF, context 0xA7) */
+size_t rns_build_formation_pkt(const rns_formation_pkt_t *f,
+                               uint8_t *out_pkt,
+                               size_t max_len);
+
+bool rns_parse_formation_pkt(const uint8_t *pkt,
+                             size_t len,
+                             rns_formation_pkt_t *out_f);
+
+/* Compute the 3D GPS position + NED velocity feed-forward target for `slot_id` (0=Leader, 1..7=Followers) */
+bool rns_compute_formation_slot_cmd(const rns_formation_pkt_t *f,
+                                    uint8_t slot_id,
+                                    rns_drone_cmd_t *out_cmd);
 
 #ifdef __cplusplus
 }

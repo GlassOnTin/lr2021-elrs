@@ -145,6 +145,11 @@ static uint8_t              g_mav_tx_seq = 0U;
 static rns_node_identity_t  g_rns_id;
 static rns_peer_table_t     g_rns_peers;
 static uint8_t              g_rns_cmd_seq = 1U;
+static uint8_t              g_swarm_slot_id      = 0U;   /* 0 = Leader, 1..7 = Wingman/Follower slots */
+static uint8_t              g_form_seq           = 1U;
+static bool                 g_mesh_ctrl_active   = false;
+static uint32_t             g_last_mesh_ctrl_ms  = 0U;
+#define RNS_MESH_WATCHDOG_MS 3000U /* 3.0s dead-man brake matching Anisoptera GUID_TIMEOUT */
 
 static void format_hex_bytes(const uint8_t *in, size_t len, char *out) {
     static const char hex[] = "0123456789abcdef";
@@ -1469,6 +1474,26 @@ static void inspect_and_act_on_rns_packet(const uint8_t *pkt, uint16_t len, cons
         }
     }
 
+        /* 0d. Check if Multi-Drone Formation State / Setpoint Packet (RNSF context 0xA7) */
+    rns_formation_pkt_t fp;
+    if (rns_parse_formation_pkt(pkt, len, &fp)) {
+        rns_drone_cmd_t fcmd;
+        if (rns_compute_formation_slot_cmd(&fp, g_swarm_slot_id, &fcmd)) {
+            uint8_t mav_frame[72];
+            size_t mav_len = rns_build_mavlink_command(&fcmd, g_mav_tx_seq++, mav_frame, sizeof(mav_frame));
+            if (mav_len > 0U) {
+                hal_crsf_uart_write(mav_frame, mav_len);
+            }
+            g_last_mesh_ctrl_ms = hal_millis();
+            g_mesh_ctrl_active  = (fp.shape != RNS_FORM_HOLD_BRAKE);
+            hal_usb_uart_printf("RNS_FORM_RX src=%s hops=%u seq=%u shape=%u slot=%u lat=%ld lon=%ld alt_mm=%ld vx=%d vy=%d mav_len=%u\r\n",
+                                src_tag, hops, (unsigned)fp.seq, (unsigned)fp.shape, (unsigned)g_swarm_slot_id,
+                                (long)fcmd.lat_deg_e7, (long)fcmd.lon_deg_e7, (long)fp.leader_alt_mm,
+                                (int)fp.vx_cms, (int)fp.vy_cms, (unsigned)mav_len);
+            return;
+        }
+    }
+
     /* 1. Check if addressed to "rnlog.beacon" */
     if (!ifac && memcmp(&pkt[2], RNS_DEST_RNLOG_BEACON, 16U) == 0) {
         uint16_t pay_len = (uint16_t)(len - RNS_MIN_PACKET_LEN);
@@ -1488,10 +1513,16 @@ static void inspect_and_act_on_rns_packet(const uint8_t *pkt, uint16_t len, cons
                 }
             }
         }
-        uint8_t mav_frame[64];
+        uint8_t mav_frame[72];
         size_t mav_len = rns_build_mavlink_command(&dcmd, g_mav_tx_seq++, mav_frame, sizeof(mav_frame));
         if (mav_len > 0U) {
             hal_crsf_uart_write(mav_frame, mav_len);
+        }
+        if (dcmd.type == RNS_DRONE_CMD_VEL_NED || dcmd.type == RNS_DRONE_CMD_GLOBAL_POS_VEL) {
+            g_last_mesh_ctrl_ms = hal_millis();
+            g_mesh_ctrl_active  = true;
+        } else if (dcmd.type == RNS_DRONE_CMD_LOITER || dcmd.type == RNS_DRONE_CMD_RTL || dcmd.type == RNS_DRONE_CMD_LAND) {
+            g_mesh_ctrl_active  = false;
         }
         hal_usb_uart_printf("RNS_CMD_RX src=%s hops=%u cmd=\"%.*s\" type=%u mav_len=%u mav_hex=",
                             src_tag, hops, (int)pay_len, (const char *)&pkt[RNS_MIN_PACKET_LEN],
@@ -1673,7 +1704,9 @@ static void handle_cli_command(char *line) {
             "  rns_to <dest|sel> <cmd>        - Send command/PING to specific 16B Reticulum RX address\r\n"
             "  crsf_lua <status|peer|ann|pair|ping|loiter|rtl> - Test EdgeTX Lua CRSF 0x7A/0x7B bridge\r\n"
             "  crsf_ota <status|peer|ann|pair|ping|loiter|rtl> - Tunnel CRSF 0x7A request over the air to RX\r\n"
-            "  rns_cmd <GOTO lat lon alt|RTL|LAND|ARM|DISARM|MODE n|RC c1 c2 c3 c4> - Send RNS drone cmd\r\n"
+            "  rns_slot <0..7>                - Set drone formation slot (0=Leader, 1=Left1, 2=Right1, ...)\r\n"
+            "  rns_form <vee|line|col|hold> [spacing_m] [vn_ms] [ve_ms] [hdg_deg] - Broadcast formation state\r\n"
+            "  rns_cmd <GOTO|VEL|BVL|RTL|LAND|LOITER|ARM|DISARM|MODE n|RC ...>    - Send RNS drone cmd\r\n"
             "  rns_tx <hex_bytes>             - Send raw Reticulum packet over Relay LoRa or ELRS tunnel\r\n"
             "  fc_sim <lat_e7> <lon_e7> <alt_m> <vbatt_mv> - Set simulated FC telemetry for beacons\r\n"
             "  mav_rx <hex_bytes>             - Feed raw MAVLink v1/v2 frame into FC telemetry parser\r\n"
@@ -2153,6 +2186,66 @@ static void handle_cli_command(char *line) {
         return;
     }
 
+    if (strcmp(cmd, "rns_slot") == 0) {
+        char *arg = strtok(NULL, " ");
+        if (arg != NULL) {
+            uint8_t slot = (uint8_t)strtoul(arg, NULL, 10);
+            if (slot <= 7U) {
+                g_swarm_slot_id = slot;
+            }
+        }
+        hal_usb_uart_printf("OK RNS_SLOT slot=%u role=%s\r\n",
+                            (unsigned)g_swarm_slot_id,
+                            (g_swarm_slot_id == 0U) ? "LEADER" : "FOLLOWER");
+        return;
+    }
+
+    if (strcmp(cmd, "rns_form") == 0) {
+        char *shape_s = strtok(NULL, " ");
+        if (shape_s == NULL) {
+            hal_usb_uart_puts("ERR: usage: rns_form <vee|line|col|hold> [spacing_m] [vn_ms] [ve_ms] [hdg_deg]\r\n");
+            return;
+        }
+        uint8_t shape = RNS_FORM_VEE;
+        if (strcasecmp(shape_s, "vee") == 0)       shape = RNS_FORM_VEE;
+        else if (strcasecmp(shape_s, "line") == 0) shape = RNS_FORM_LINE_ABREAST;
+        else if (strcasecmp(shape_s, "col") == 0)  shape = RNS_FORM_COLUMN;
+        else if (strcasecmp(shape_s, "hold") == 0 || strcasecmp(shape_s, "brake") == 0) shape = RNS_FORM_HOLD_BRAKE;
+
+        char *sp_s  = strtok(NULL, " ");
+        char *vn_s  = strtok(NULL, " ");
+        char *ve_s  = strtok(NULL, " ");
+        char *hdg_s = strtok(NULL, " ");
+
+        float spacing_m = sp_s  ? strtof(sp_s, NULL)  : 10.0f;
+        float vn_ms     = vn_s  ? strtof(vn_s, NULL)  : 0.0f;
+        float ve_ms     = ve_s  ? strtof(ve_s, NULL)  : 0.0f;
+        float hdg_deg   = hdg_s ? strtof(hdg_s, NULL) : 0.0f;
+
+        rns_formation_pkt_t fp;
+        memset(&fp, 0, sizeof(fp));
+        memcpy(fp.leader_dest, g_rns_id.dest_hash, 16U);
+        fp.seq           = g_form_seq++;
+        fp.shape         = shape;
+        fp.spacing_dm    = (uint16_t)(spacing_m * 10.0f);
+        fp.leader_lat_e7 = (g_fc_tlm.lat_deg_e7 != 0) ? g_fc_tlm.lat_deg_e7 : -353632620L;
+        fp.leader_lon_e7 = (g_fc_tlm.lon_deg_e7 != 0) ? g_fc_tlm.lon_deg_e7 : 1491652370L;
+        fp.leader_alt_mm = (g_fc_tlm.rel_alt_mm != 0) ? g_fc_tlm.rel_alt_mm : 25000L;
+        fp.vx_cms        = (int16_t)(vn_ms * 100.0f);
+        fp.vy_cms        = (int16_t)(ve_ms * 100.0f);
+        fp.vz_cms        = 0;
+        fp.heading_cdeg  = (uint16_t)(hdg_deg * 100.0f);
+
+        uint8_t pkt[64];
+        size_t flen = rns_build_formation_pkt(&fp, pkt, sizeof(pkt));
+        bool ok = send_or_tunnel_rns_packet(pkt, (uint16_t)flen);
+        hal_usb_uart_printf("OK RNS_FORM_TX sent=%u seq=%u shape=%u spacing_dm=%u lat=%ld lon=%ld vx=%d vy=%d hdg=%u\r\n",
+                            ok ? 1U : 0U, (unsigned)fp.seq, (unsigned)fp.shape, (unsigned)fp.spacing_dm,
+                            (long)fp.leader_lat_e7, (long)fp.leader_lon_e7,
+                            (int)fp.vx_cms, (int)fp.vy_cms, (unsigned)fp.heading_cdeg);
+        return;
+    }
+
     if (strcmp(cmd, "rns_cmd") == 0) {
         char *rest = strtok(NULL, "");
         if (rest == NULL) {
@@ -2555,6 +2648,8 @@ int main(void) {
                 hal_led_toggle();
                 uint8_t orig_hops = (rx_len > 1U) ? rx_copy[1] : 0U;
                 inspect_and_act_on_rns_packet(rx_copy, rx_len, "LORA");
+                /* Cross-link bridge: if ELRS tunnel is free, also queue for downlink/uplink tunnel */
+                (void)elrs_tunnel_enqueue_tx(&g_elrs_tunnel, rx_copy, rx_len, g_ota.is_full_res);
                 if (!g_relay_pending &&
                     rns_relay_should_forward(&g_rns_relay, rx_copy, rx_len, now_ms)) {
                     memcpy(g_relay_tx_buf, rx_copy, rx_len);
@@ -2645,7 +2740,33 @@ int main(void) {
                 hal_usb_uart_puts("\r\n");
 
                 inspect_and_act_on_rns_packet(tun_pkt, tun_len, "ELRS_TUNNEL");
+                /* Record in relay dedup table so if Drone 1 acts as an airborne relay or bridges
+                 * between ELRS DATA tunnel and Reticulum mesh, it increments hops and avoids loops */
+                uint8_t relay_copy[RNODE_LORA_MAX_PKT];
+                if (tun_len <= sizeof(relay_copy)) {
+                    memcpy(relay_copy, tun_pkt, tun_len);
+                    if (rns_relay_should_forward(&g_rns_relay, relay_copy, tun_len, now_ms) && !g_relay_pending) {
+                        memcpy(g_relay_tx_buf, relay_copy, tun_len);
+                        g_relay_tx_len  = (uint8_t)tun_len;
+                        g_relay_due_ms  = now_ms + 80U + (uint32_t)(hal_micros() & 0x3FU);
+                        g_relay_pending = true;
+                    }
+                }
             }
+        }
+
+        /* 4b. Mesh Control Dead-Man Watchdog (3.0s timeout -> automatic zero-velocity brake + LOITER) */
+        if (g_mesh_ctrl_active && (int32_t)(hal_millis() - g_last_mesh_ctrl_ms) >= (int32_t)RNS_MESH_WATCHDOG_MS) {
+            g_mesh_ctrl_active = false;
+            rns_drone_cmd_t stop_cmd;
+            memset(&stop_cmd, 0, sizeof(stop_cmd));
+            stop_cmd.type = RNS_DRONE_CMD_LOITER;
+            uint8_t mav_frame[64];
+            size_t mav_len = rns_build_mavlink_command(&stop_cmd, g_mav_tx_seq++, mav_frame, sizeof(mav_frame));
+            if (mav_len > 0U) {
+                hal_crsf_uart_write(mav_frame, mav_len);
+            }
+            hal_usb_uart_printf("RNS_MESH_FAILSAFE action=LOITER timeout_ms=%u\r\n", (unsigned)RNS_MESH_WATCHDOG_MS);
         }
 
         /* 5. Periodic Reticulum Telemetry Beacon (rnlog.beacon) */
