@@ -4,11 +4,60 @@
 """Host CLI and bench control utility for Seeed Wio-LR2021 + XIAO nRF54L15 ELRS nodes."""
 
 import argparse
+import struct
 import subprocess
 import sys
 import time
 
 import serial
+
+FEND = 0xC0
+FESC = 0xDB
+TFEND = 0xDC
+TFESC = 0xDD
+
+
+def kiss_encode(cmd: int, payload: bytes = b"") -> bytes:
+    """Encode a single RNode KISS frame."""
+    out = bytearray([FEND, cmd & 0xFF])
+    for b in payload:
+        if b == FEND:
+            out.extend([FESC, TFEND])
+        elif b == FESC:
+            out.extend([FESC, TFESC])
+        else:
+            out.append(b)
+    out.append(FEND)
+    return bytes(out)
+
+
+def kiss_decode_stream(raw: bytes) -> list:
+    """Decode all complete RNode KISS frames from a byte stream."""
+    frames = []
+    in_frame = False
+    esc = False
+    buf = bytearray()
+    for b in raw:
+        if b == FEND:
+            if in_frame and len(buf) >= 1:
+                frames.append((buf[0], bytes(buf[1:])))
+            buf.clear()
+            in_frame = True
+            esc = False
+        elif in_frame:
+            if esc:
+                if b == TFEND:
+                    buf.append(FEND)
+                elif b == TFESC:
+                    buf.append(FESC)
+                else:
+                    buf.append(b)
+                esc = False
+            elif b == FESC:
+                esc = True
+            else:
+                buf.append(b)
+    return frames
 
 
 class LR2021Node:
@@ -87,12 +136,38 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("rates", help="List all 17 supported 900 MHz, 2.4 GHz, and dual-band air rates")
 
     p_cfg = sub.add_parser("configure", help="Configure domain, air rate, UID/phrase, power, and mode")
-    p_cfg.add_argument("--domain", choices=["fcc915", "au915", "eu868", "ism2g4", "ce2g4"])
+    p_cfg.add_argument("--domain", choices=["fcc915", "au915", "eu868", "ism2g4", "ce2g4", "ce_lbt"])
     p_cfg.add_argument("--rate", help="Rate index (0..16) or name (e.g. 900_200HZ, 2G4_500HZ)")
     p_cfg.add_argument("--phrase", help="ExpressLRS binding phrase")
     p_cfg.add_argument("--uid", help="Explicit 6-byte UID in XX:XX:XX:XX:XX:XX format")
     p_cfg.add_argument("--power", type=int, help="TX power in dBm (-9..22 LF, -19..12 HF)")
-    p_cfg.add_argument("--mode", choices=["idle", "tx", "rx", "monitor", "bridge"])
+    p_cfg.add_argument("--mode", choices=["idle", "tx", "rx", "monitor", "bridge", "rnode", "relay"])
+
+    p_rcfg = sub.add_parser("rnode-cfg", help="Configure RNode / Relay RF parameters")
+    p_rcfg.add_argument("--freq", type=int, default=867200000, help="Center frequency in Hz")
+    p_rcfg.add_argument("--bw", type=int, default=125000, help="Bandwidth in Hz")
+    p_rcfg.add_argument("--sf", type=int, default=7, help="Spreading factor (5..12)")
+    p_rcfg.add_argument("--cr", type=int, default=5, help="Coding rate denominator (5..8 for 4/5..4/8)")
+
+    p_bcn = sub.add_parser("rns-beacon", help="Trigger Reticulum FC telemetry beacon or set interval")
+    p_bcn.add_argument("--interval-ms", type=int, help="Periodic beacon interval in ms (0 to disable)")
+    p_bcn.add_argument("--sim-gps", nargs=4, type=int, metavar=("LAT_E7", "LON_E7", "ALT_M", "VBATT_MV"),
+                       help="Optional simulated FC GPS/battery state before sending beacon")
+
+    p_rcmd = sub.add_parser("rns-cmd", help="Send Reticulum drone command over LoRa or ELRS DATA tunnel")
+    p_rcmd.add_argument("command", nargs="+",
+                        help="Command string (e.g. GOTO 0 0 85 | RTL | LOITER | LAND | ARM | DISARM)")
+
+    p_rtx = sub.add_parser("rns-tx", help="Transmit or tunnel raw hex Reticulum packet")
+    p_rtx.add_argument("hex_payload", help="Hexadecimal Reticulum packet bytes")
+
+    p_kiss = sub.add_parser("rnode-kiss-test", help="Verify RNode KISS handshake and optional packet TX")
+    p_kiss.add_argument("--freq", type=int, default=867200000, help="Frequency in Hz")
+    p_kiss.add_argument("--bw", type=int, default=125000, help="Bandwidth in Hz")
+    p_kiss.add_argument("--sf", type=int, default=7, help="Spreading factor (5..12)")
+    p_kiss.add_argument("--cr", type=int, default=5, help="Coding rate (5..8)")
+    p_kiss.add_argument("--power", type=int, default=10, help="TX power in dBm")
+    p_kiss.add_argument("--leave", action="store_true", help="Send CMD_LEAVE (0x0A) after test to return to CLI")
 
     p_ping = sub.add_parser("ping", help="Run active RF ping test on 868/900 MHz or 2.4 GHz")
     p_ping.add_argument("--freq", type=int, default=868000000, help="Frequency in Hz")
@@ -189,6 +264,46 @@ def main() -> int:
         elif args.subcmd == "rc":
             ch_str = " ".join(str(v) for v in args.channels[:16])
             print(node.send_cmd(f"rc {ch_str}", wait_s=0.2))
+        elif args.subcmd == "rnode-cfg":
+            print(node.send_cmd(f"rnode_cfg {args.freq} {args.bw} {args.sf} {args.cr}", wait_s=0.3))
+        elif args.subcmd == "rns-beacon":
+            if args.sim_gps:
+                lat, lon, alt, vb = args.sim_gps
+                print(node.send_cmd(f"fc_sim {lat} {lon} {alt} {vb}", wait_s=0.2))
+            if args.interval_ms is not None:
+                print(node.send_cmd(f"bcn {args.interval_ms}", wait_s=0.2))
+            else:
+                print(node.send_cmd("bcn now", wait_s=0.35))
+        elif args.subcmd == "rns-cmd":
+            cmd_str = " ".join(args.command)
+            print(node.send_cmd(f"rns_cmd {cmd_str}", wait_s=0.35))
+        elif args.subcmd == "rns-tx":
+            print(node.send_cmd(f"rns_tx {args.hex_payload}", wait_s=0.35))
+        elif args.subcmd == "rnode-kiss-test":
+            kiss_pkt = (
+                kiss_encode(0x08, bytes([0x73]))
+                + kiss_encode(0x14, bytes([0x00]))
+                + kiss_encode(0x48, bytes([0x00]))
+                + kiss_encode(0x49, bytes([0x00]))
+                + kiss_encode(0x01, struct.pack(">I", args.freq))
+                + kiss_encode(0x02, struct.pack(">I", args.bw))
+                + kiss_encode(0x03, bytes([args.power & 0xFF]))
+                + kiss_encode(0x04, bytes([args.sf & 0xFF]))
+                + kiss_encode(0x05, bytes([args.cr & 0xFF]))
+                + kiss_encode(0x06, bytes([0x01]))
+            )
+            node.ser.reset_input_buffer()
+            node.ser.write(kiss_pkt)
+            node.ser.flush()
+            time.sleep(0.3)
+            raw = node.ser.read(4096)
+            for cmd_id, pl in kiss_decode_stream(raw):
+                print(f"KISS RX cmd=0x{cmd_id:02X} len={len(pl)} payload={pl.hex()}")
+            if args.leave:
+                node.ser.write(kiss_encode(0x0A, bytes([0xFF])))
+                node.ser.flush()
+                time.sleep(0.15)
+                print(node.ser.read(1024).decode("utf-8", errors="replace").strip())
         elif args.subcmd == "monitor":
             print(node.send_cmd("mode monitor", wait_s=0.3))
             end_t = time.monotonic() + args.duration

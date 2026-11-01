@@ -18,6 +18,10 @@
 static lr2021_mod_type_t   g_mod_type       = LR2021_MOD_LORA;
 static bool                g_is_sub_ghz     = true;
 static uint8_t             g_payload_len    = 8U;
+static uint16_t            g_lora_preamble  = 8U;
+static bool                g_lora_invert_iq = false;
+static bool                g_lora_explicit  = false;
+static bool                g_lora_crc_en    = false;
 static bool                g_fsk_use_fec    = false;
 static int8_t              g_pwr_lf_half_db = 20; /* +10 dBm default (20 * 0.5 dBm) */
 static int8_t              g_pwr_hf_half_db = 20; /* +10 dBm default (20 * 0.5 dBm) */
@@ -95,10 +99,10 @@ static inline void irq_restore(uint32_t primask) {
     }
 }
 
-static uint16_t lr2021_write_cmd(uint16_t opcode, const uint8_t *args, uint8_t arg_len, uint32_t wait_us) {
-    uint8_t buf[2 + 64];
-    if (arg_len > 64U) {
-        arg_len = 64U;
+static uint16_t lr2021_write_cmd(uint16_t opcode, const uint8_t *args, uint16_t arg_len, uint32_t wait_us) {
+    uint8_t buf[2 + 256];
+    if (arg_len > 255U) {
+        arg_len = 255U;
     }
     buf[0] = (uint8_t)(opcode >> 8U);
     buf[1] = (uint8_t)(opcode & 0xFFU);
@@ -114,7 +118,7 @@ static uint16_t lr2021_write_cmd(uint16_t opcode, const uint8_t *args, uint8_t a
     return (uint16_t)(((uint16_t)buf[0] << 8U) | buf[1]);
 }
 
-static uint16_t lr2021_read_response(uint8_t *buf, uint8_t len, uint32_t wait_us) {
+static uint16_t lr2021_read_response(uint8_t *buf, uint16_t len, uint32_t wait_us) {
     uint32_t pm = irq_save();
     (void)hal_radio_wait_on_busy(wait_us);
     hal_radio_spi_transfer(buf, len);
@@ -191,12 +195,39 @@ static void lr2021_dio8_isr_handler(void) {
     }
     if ((irq & LR2021_IRQ_RX_DONE) != 0UL) {
         g_rx_done_count++;
+        lr2021_pkt_stats_t stats;
+        lr2021_decode_last_pkt_stats(&stats);
+
+        if (g_mod_type == LR2021_MOD_LORA && g_lora_explicit) {
+            /* Check hardware LoRa header error (bit 9 = 0x200) and CRC error (bit 22 = 0x400000) */
+            if ((irq & (1UL << 9)) != 0UL || (g_lora_crc_en && (irq & (1UL << 22)) != 0UL)) {
+                (void)lr2021_write_cmd(LR2021_SYSTEM_CLEAR_RX_FIFO_OC, NULL, 0U, 5000U);
+                return;
+            }
+            uint8_t rx_len = stats.status_raw[3];
+            if (rx_len == 0U) {
+                (void)lr2021_write_cmd(LR2021_SYSTEM_CLEAR_RX_FIFO_OC, NULL, 0U, 5000U);
+                return;
+            }
+            uint8_t fifo_buf[258];
+            memset(fifo_buf, 0, (size_t)rx_len + 2U);
+            fifo_buf[0] = (uint8_t)(LR2021_RADIO_READ_RX_FIFO >> 8U);
+            fifo_buf[1] = (uint8_t)(LR2021_RADIO_READ_RX_FIFO & 0xFFU);
+            (void)lr2021_read_response(fifo_buf, (uint16_t)rx_len + 2U, 10000U);
+            (void)lr2021_write_cmd(LR2021_SYSTEM_CLEAR_RX_FIFO_OC, NULL, 0U, 5000U);
+
+            if (g_rx_done_cb != NULL) {
+                g_rx_done_cb(&fifo_buf[2], rx_len, &stats);
+            }
+            return;
+        }
+
         uint8_t raw_len = (g_mod_type == LR2021_MOD_FSK && g_fsk_use_fec) ? 14U : g_payload_len;
         uint8_t fifo_buf[66];
         memset(fifo_buf, 0, sizeof(fifo_buf));
         fifo_buf[0] = (uint8_t)(LR2021_RADIO_READ_RX_FIFO >> 8U);
         fifo_buf[1] = (uint8_t)(LR2021_RADIO_READ_RX_FIFO & 0xFFU);
-        (void)lr2021_read_response(fifo_buf, (uint8_t)(raw_len + 2U), 5000U);
+        (void)lr2021_read_response(fifo_buf, (uint16_t)(raw_len + 2U), 5000U);
 
         uint8_t decoded[64];
         if (g_mod_type == LR2021_MOD_FSK && g_fsk_use_fec) {
@@ -206,9 +237,6 @@ static void lr2021_dio8_isr_handler(void) {
         }
 
         (void)lr2021_write_cmd(LR2021_SYSTEM_CLEAR_RX_FIFO_OC, NULL, 0U, 5000U);
-
-        lr2021_pkt_stats_t stats;
-        lr2021_decode_last_pkt_stats(&stats);
 
         if (g_rx_done_cb != NULL) {
             g_rx_done_cb(decoded, g_payload_len, &stats);
@@ -403,9 +431,13 @@ void lr2021_config_lora(uint8_t bw,
                         uint8_t payload_len,
                         bool explicit_header,
                         bool crc_en) {
-    g_mod_type    = LR2021_MOD_LORA;
-    g_payload_len = payload_len;
-    g_is_sub_ghz  = (freq_hz < 1000000000UL);
+    g_mod_type       = LR2021_MOD_LORA;
+    g_payload_len    = payload_len;
+    g_lora_preamble  = preamble_len;
+    g_lora_invert_iq = invert_iq;
+    g_lora_explicit  = explicit_header;
+    g_lora_crc_en    = crc_en;
+    g_is_sub_ghz     = (freq_hz < 1000000000UL);
 
     lr2021_set_mode(LR2021_MODE_STDBY_RC);
 
@@ -414,9 +446,17 @@ void lr2021_config_lora(uint8_t bw,
 
     lr2021_apply_rx_path_and_pa(freq_hz);
 
+    /* Enable LDRO (0x01) automatically for high spreading factors (SF11/SF12 at <=125kHz, SF12 at 250kHz) */
+    uint8_t ldro = 0U;
+    if ((bw == LR2021_RADIO_LORA_BW_125 && sf >= 11U) ||
+        (bw == LR2021_RADIO_LORA_BW_62  && sf >= 10U) ||
+        (bw == LR2021_RADIO_LORA_BW_250 && sf >= 12U)) {
+        ldro = 1U;
+    }
+
     const uint8_t mod_params[2] = {
         (uint8_t)((sf << 4U) | (bw & 0x0FU)),
-        (uint8_t)(cr << 4U)
+        (uint8_t)((cr << 4U) | ldro)
     };
     (void)lr2021_write_cmd(LR2021_RADIO_SET_LORA_MODULATION_PARAM_OC, mod_params, sizeof(mod_params), 10000U);
 
@@ -456,6 +496,25 @@ void lr2021_config_lora(uint8_t bw,
     lr2021_clear_irq();
     (void)lr2021_write_cmd(LR2021_SYSTEM_CLEAR_RX_FIFO_OC, NULL, 0U, 10000U);
     (void)lr2021_write_cmd(LR2021_SYSTEM_CLEAR_TX_FIFO_OC, NULL, 0U, 10000U);
+}
+
+void lr2021_set_lora_syncword(uint8_t syncword) {
+    (void)lr2021_write_cmd(LR2021_RADIO_SET_LORA_SYNCWORD_OC, &syncword, 1U, 10000U);
+}
+
+uint8_t lr2021_lora_bw_from_hz(uint32_t bw_hz) {
+    if (bw_hz <= 31250UL)  return LR2021_RADIO_LORA_BW_31;
+    if (bw_hz <= 41670UL)  return LR2021_RADIO_LORA_BW_41;
+    if (bw_hz <= 62500UL)  return LR2021_RADIO_LORA_BW_62;
+    if (bw_hz <= 83340UL)  return LR2021_RADIO_LORA_BW_83;
+    if (bw_hz <= 101563UL) return LR2021_RADIO_LORA_BW_101;
+    if (bw_hz <= 125000UL) return LR2021_RADIO_LORA_BW_125;
+    if (bw_hz <= 203125UL) return LR2021_RADIO_LORA_BW_200;
+    if (bw_hz <= 250000UL) return LR2021_RADIO_LORA_BW_250;
+    if (bw_hz <= 406250UL) return LR2021_RADIO_LORA_BW_400;
+    if (bw_hz <= 500000UL) return LR2021_RADIO_LORA_BW_500;
+    if (bw_hz <= 812500UL) return LR2021_RADIO_LORA_BW_800;
+    return LR2021_RADIO_LORA_BW_1000;
 }
 
 void lr2021_config_flrc(uint8_t bw_br,
@@ -629,24 +688,43 @@ void lr2021_set_tx_power_dbm(int8_t power_dbm, bool is_sub_ghz) {
 }
 
 void lr2021_tx_nb(const uint8_t *data, uint8_t len) {
-    uint8_t out_buf[64];
+    uint8_t out_buf[255];
     uint8_t wire_len = len;
     if (g_mod_type == LR2021_MOD_FSK && g_fsk_use_fec && len == 8U) {
         fec_encode_8_to_14(data, out_buf);
         wire_len = 14U;
     } else {
-        if (wire_len > sizeof(out_buf)) {
-            wire_len = sizeof(out_buf);
-        }
         memcpy(out_buf, data, wire_len);
     }
 
     lr2021_set_mode(LR2021_MODE_FS);
-    (void)lr2021_write_cmd(LR2021_RADIO_WRITE_TX_FIFO, out_buf, wire_len, 5000U);
+    if (g_mod_type == LR2021_MOD_LORA && g_lora_explicit) {
+        uint8_t iq_bit = (!g_is_sub_ghz && g_lora_invert_iq) ? LR2021_RADIO_LORA_IQ_INVERTED : LR2021_RADIO_LORA_IQ_STANDARD;
+        uint8_t crc_bit = g_lora_crc_en ? 1U : 0U;
+        const uint8_t pkt_params[4] = {
+            (uint8_t)(g_lora_preamble >> 8U),
+            (uint8_t)(g_lora_preamble & 0xFFU),
+            wire_len,
+            (uint8_t)((LR2021_LORA_PACKET_EXPLICIT << 2U) | (crc_bit << 1U) | iq_bit)
+        };
+        (void)lr2021_write_cmd(LR2021_RADIO_SET_LORA_PACKET_PARAMS_OC, pkt_params, sizeof(pkt_params), 10000U);
+    }
+    (void)lr2021_write_cmd(LR2021_RADIO_WRITE_TX_FIFO, out_buf, wire_len, 10000U);
     lr2021_set_mode(LR2021_MODE_TX);
 }
 
 void lr2021_rx_nb(void) {
+    if (g_mod_type == LR2021_MOD_LORA && g_lora_explicit) {
+        uint8_t iq_bit = (!g_is_sub_ghz && g_lora_invert_iq) ? LR2021_RADIO_LORA_IQ_INVERTED : LR2021_RADIO_LORA_IQ_STANDARD;
+        uint8_t crc_bit = g_lora_crc_en ? 1U : 0U;
+        const uint8_t pkt_params[4] = {
+            (uint8_t)(g_lora_preamble >> 8U),
+            (uint8_t)(g_lora_preamble & 0xFFU),
+            g_payload_len,
+            (uint8_t)((LR2021_LORA_PACKET_EXPLICIT << 2U) | (crc_bit << 1U) | iq_bit)
+        };
+        (void)lr2021_write_cmd(LR2021_RADIO_SET_LORA_PACKET_PARAMS_OC, pkt_params, sizeof(pkt_params), 10000U);
+    }
     lr2021_set_mode(LR2021_MODE_RX_CONT);
 }
 

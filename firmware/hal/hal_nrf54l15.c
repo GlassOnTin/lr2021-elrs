@@ -43,8 +43,8 @@ static uart_rx_ring_t g_crsf_rx_ring;
 
 static uint8_t g_usb_tx_dma_buf[256] __attribute__((aligned(4)));
 static uint8_t g_crsf_tx_dma_buf[128] __attribute__((aligned(4)));
-static uint8_t g_spi_tx_dma_buf[256] __attribute__((aligned(4)));
-static uint8_t g_spi_rx_dma_buf[256] __attribute__((aligned(4)));
+static uint8_t g_spi_tx_dma_buf[264] __attribute__((aligned(4)));
+static uint8_t g_spi_rx_dma_buf[264] __attribute__((aligned(4)));
 
 /* DIO8 ISR callback */
 static volatile hal_dio_isr_cb_t g_dio_isr_cb = NULL;

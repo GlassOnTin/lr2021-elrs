@@ -62,6 +62,12 @@ void lr2021_config_lora(uint8_t bw,
                         bool explicit_header,
                         bool crc_en);
 
+/* Set LoRa syncword (0x12 = private/RNode, 0x34 = public) */
+void lr2021_set_lora_syncword(uint8_t syncword);
+
+/* Map bandwidth in Hz (e.g. 125000, 250000, 500000) to LR2021_RADIO_LORA_BW_* code */
+uint8_t lr2021_lora_bw_from_hz(uint32_t bw_hz);
+
 /* Configure 2.4 GHz FLRC modulation & packet parameters (ELRS D500 / F500 / F1000 or High-Speed Bridge) */
 void lr2021_config_flrc(uint8_t bw_br,
                         uint8_t cr,
