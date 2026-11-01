@@ -1575,21 +1575,14 @@ static size_t process_crsf_rns_frame(const uint8_t *frame, uint8_t frame_len, ui
 
         case CRSF_RNS_SUBCMD_SET_CFG: {
             /* Payload: [freq_be(4), bw_be(4), sf(1), cr(1), txpwr(1), ifac_en(1)] */
-            if (frame_len >= 19U) {
-                const uint8_t *p = &frame[6];
-                g_rnode_cfg.frequency_hz = ((uint32_t)p[0] << 24U) |
-                                           ((uint32_t)p[1] << 16U) |
-                                           ((uint32_t)p[2] << 8U)  |
-                                           (uint32_t)p[3];
-                g_rnode_cfg.bandwidth_hz = ((uint32_t)p[4] << 24U) |
-                                           ((uint32_t)p[5] << 16U) |
-                                           ((uint32_t)p[6] << 8U)  |
-                                           (uint32_t)p[7];
-                g_rnode_cfg.sf           = p[8];
-                g_rnode_cfg.cr           = p[9];
-                g_rnode_cfg.txpower_dbm  = (int8_t)p[10];
-                bool ifac_en             = (p[11] != 0U);
-                rns_identity_set_ifac(&g_rns_id, ifac_en, g_rns_id.ifac_pass[0] ? g_rns_id.ifac_pass : "elrs-mesh");
+            crsf_rns_cfg_cmd_t cfg;
+            if (crsf_decode_rns_set_cfg_frame(frame, frame_len, &cfg)) {
+                g_rnode_cfg.frequency_hz = cfg.freq_hz;
+                g_rnode_cfg.bandwidth_hz = cfg.bw_hz;
+                g_rnode_cfg.sf           = cfg.sf;
+                g_rnode_cfg.cr           = cfg.cr;
+                g_rnode_cfg.txpower_dbm  = cfg.txpower_dbm;
+                rns_identity_set_ifac(&g_rns_id, cfg.ifac_enabled, g_rns_id.ifac_pass[0] ? g_rns_id.ifac_pass : "elrs-mesh");
                 if (g_app_mode == APP_MODE_RNODE || g_app_mode == APP_MODE_RELAY) {
                     configure_radio_for_rnode();
                 }

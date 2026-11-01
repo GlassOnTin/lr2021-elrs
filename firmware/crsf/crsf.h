@@ -144,10 +144,28 @@ bool   crsf_decode_rns_status_frame(const uint8_t *frame, size_t frame_len, crsf
 size_t crsf_build_rns_peer_frame(const crsf_rns_peer_info_t *pi, uint8_t out_frame[CRSF_MAX_FRAME_LEN]);
 bool   crsf_decode_rns_peer_frame(const uint8_t *frame, size_t frame_len, crsf_rns_peer_info_t *out_pi);
 
-size_t crsf_build_rns_ack_frame(uint8_t subcmd, uint8_t status_code, uint8_t out_frame[CRSF_MAX_FRAME_LEN]);
+typedef struct {
+    uint32_t freq_hz;
+    uint32_t bw_hz;
+    uint8_t  sf;
+    uint8_t  cr;
+    int8_t   txpower_dbm;
+    bool     ifac_enabled;
+} crsf_rns_cfg_cmd_t;
 
-/* Build CRSF_FRAMETYPE_RNS_CMD (0x7A) extended command frame (Handset -> TX Module) */
+size_t crsf_build_rns_ack_frame(uint8_t subcmd, uint8_t status_code, uint8_t out_frame[CRSF_MAX_FRAME_LEN]);
+bool   crsf_decode_rns_ack_frame(const uint8_t *frame, size_t frame_len, uint8_t *out_subcmd, uint8_t *out_status_code);
+
+/* Build & decode CRSF_FRAMETYPE_RNS_CMD (0x7A) extended command frame (Handset -> TX Module / OTA RX) */
 size_t crsf_build_rns_cmd_frame(uint8_t subcmd, const uint8_t *payload, size_t pay_len, uint8_t out_frame[CRSF_MAX_FRAME_LEN]);
+bool   crsf_decode_rns_cmd_frame(const uint8_t *frame,
+                                 size_t frame_len,
+                                 uint8_t *out_dest_addr,
+                                 uint8_t *out_orig_addr,
+                                 uint8_t *out_subcmd,
+                                 const uint8_t **out_payload,
+                                 size_t *out_pay_len);
+bool   crsf_decode_rns_set_cfg_frame(const uint8_t *frame, size_t frame_len, crsf_rns_cfg_cmd_t *out_cfg);
 
 #ifdef __cplusplus
 }

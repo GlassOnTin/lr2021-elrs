@@ -70,7 +70,7 @@ cmake -B build -DCMAKE_TOOLCHAIN_FILE=firmware/toolchain-arm-none-eabi.cmake -DC
 cmake --build build -j$(nproc)
 ```
 
-### Run Host Unit Tests (10 Test Suites)
+### Run Host Unit Tests (11 Test Suites, Including Embedded EdgeTX Lua 5.2 VM)
 ```bash
 mkdir -p build_host
 g++ -std=c++17 -O2 -Wall -Wextra -I. \
@@ -78,7 +78,7 @@ g++ -std=c++17 -O2 -Wall -Wextra -I. \
     firmware/elrs/elrs_protocol.cpp \
     firmware/crsf/crsf.cpp \
     firmware/rnode/rns_node.cpp \
-    -o build_host/test_elrs_host
+    -ldl -o build_host/test_elrs_host
 ./build_host/test_elrs_host
 ```
 

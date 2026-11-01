@@ -6,9 +6,12 @@
 #include "../firmware/rnode/rns_node.h"
 
 #include <assert.h>
+#include <dlfcn.h>
 #include <stdio.h>
 #include <string.h>
 #include <set>
+#include <string>
+#include <vector>
 
 static void test_uid_md5(void) {
     /* Verify MD5("-DMY_BINDING_PHRASE=\"default ExpressLRS binding phrase\"")
@@ -663,7 +666,464 @@ static void test_rns_identity_pairing_and_lua_crsf(void) {
     }
     assert(got_rx_cmd && rx_p.buf[0] == CRSF_ADDRESS_CRSF_RECEIVER && rx_p.buf[2] == CRSF_FRAMETYPE_RNS_CMD);
 
+    /* 8. Verify CRSF 0x7A SET_CFG & 0x7B RESP_ACK round-trip + CRC tamper rejection */
+    uint8_t cfg_pay[12] = {
+        (uint8_t)((2440000000UL >> 24) & 0xFFU),
+        (uint8_t)((2440000000UL >> 16) & 0xFFU),
+        (uint8_t)((2440000000UL >> 8)  & 0xFFU),
+        (uint8_t)(2440000000UL & 0xFFU),
+        0x00, 0x07, 0xA1, 0x20, /* 500000 Hz */
+        8U,                     /* SF8 */
+        6U,                     /* CR 4/6 */
+        (uint8_t)((int8_t)-5),  /* -5 dBm */
+        1U                      /* IFAC ON */
+    };
+    size_t cfg_flen = crsf_build_rns_cmd_frame(CRSF_RNS_SUBCMD_SET_CFG, cfg_pay, sizeof(cfg_pay), cmd_buf);
+    assert(cfg_flen == 19U);
+    crsf_rns_cfg_cmd_t cfg_dec = {};
+    assert(crsf_decode_rns_set_cfg_frame(cmd_buf, cfg_flen, &cfg_dec));
+    assert(cfg_dec.freq_hz == 2440000000UL && cfg_dec.bw_hz == 500000UL);
+    assert(cfg_dec.sf == 8U && cfg_dec.cr == 6U && cfg_dec.txpower_dbm == -5 && cfg_dec.ifac_enabled);
+    cmd_buf[cfg_flen - 1U] ^= 0xFFU;
+    assert(!crsf_decode_rns_set_cfg_frame(cmd_buf, cfg_flen, &cfg_dec));
+
+    uint8_t ack_buf[16] = {0};
+    size_t ack_len = crsf_build_rns_ack_frame(CRSF_RNS_SUBCMD_SET_CFG, 0U, ack_buf);
+    assert(ack_len == 9U);
+    uint8_t ack_sub = 0U, ack_st = 99U;
+    assert(crsf_decode_rns_ack_frame(ack_buf, ack_len, &ack_sub, &ack_st));
+    assert(ack_sub == CRSF_RNS_SUBCMD_SET_CFG && ack_st == 0U);
+    ack_buf[ack_len - 1U] ^= 0xFFU;
+    assert(!crsf_decode_rns_ack_frame(ack_buf, ack_len, &ack_sub, &ack_st));
+
     printf("[PASS] test_rns_identity_pairing_and_lua_crsf (SHA-256, 16B SINGLE dest_hash, RNSA/RNSP/RNSC, CRSF 0x7A/0x7B/0x21)\n");
+}
+
+/* ============================================================================
+ * End-to-End EdgeTX Lua 5.2 VM Integration Test for tools/rns_elrs.lua
+ * ============================================================================ */
+struct LuaCrsfHarness {
+    std::vector<std::vector<uint8_t>> tx_frames; /* Handset Lua -> Module/RX (0x7A) */
+    std::vector<std::vector<uint8_t>> rx_frames; /* Module/RX -> Handset Lua (0x7B / 0x21) */
+    std::vector<std::string>          lcd_lines;
+    crsf_rns_status_t                 sim_status;
+    crsf_rns_peer_info_t              sim_peer;
+};
+
+static LuaCrsfHarness g_lua_harness;
+
+typedef struct lua_State lua_State;
+typedef int (*lua_CFunction)(lua_State *L);
+typedef ptrdiff_t lua_Integer;
+
+static lua_State *(*p_luaL_newstate)(void) = NULL;
+static void (*p_luaL_openlibs)(lua_State *L) = NULL;
+static int (*p_luaL_loadstring)(lua_State *L, const char *s) = NULL;
+static int (*p_lua_pcallk)(lua_State *L, int nargs, int nresults, int errfunc, int ctx, lua_CFunction k) = NULL;
+static void (*p_lua_pushcclosure)(lua_State *L, lua_CFunction fn, int n) = NULL;
+static void (*p_lua_setglobal)(lua_State *L, const char *name) = NULL;
+static void (*p_lua_pushlstring)(lua_State *L, const char *s, size_t len) = NULL;
+static void (*p_lua_pushnil)(lua_State *L) = NULL;
+static const char *(*p_lua_tolstring)(lua_State *L, int idx, size_t *len) = NULL;
+static void (*p_lua_close)(lua_State *L) = NULL;
+
+static int host_crsf_tx_from_lua(lua_State *L) {
+    size_t len = 0;
+    const char *bytes = p_lua_tolstring(L, 1, &len);
+    if (bytes && len >= 3U) {
+        /* Wrap into full CRSF wire frame: [0]=dest, [1]=len(type+payload+crc), [2]=cmd, [3..]=payload, [last]=crc8 */
+        uint8_t cmd = (uint8_t)bytes[0];
+        const uint8_t *pay = (const uint8_t *)&bytes[1];
+        size_t pay_len = len - 1U;
+        std::vector<uint8_t> frame(pay_len + 4U);
+        frame[0] = pay[0]; /* dest_addr (0xEE or 0xEC) */
+        frame[1] = (uint8_t)(pay_len + 2U);
+        frame[2] = cmd;
+        memcpy(&frame[3], pay, pay_len);
+        frame[3U + pay_len] = crsf_crc8(&frame[2], pay_len + 1U);
+
+        /* Verify byte-by-byte stream parsing via crsf_parser_feed_byte */
+        crsf_parser_t parser;
+        crsf_parser_init(&parser);
+        bool parsed_ok = false;
+        for (size_t i = 0; i < frame.size(); i++) {
+            if (crsf_parser_feed_byte(&parser, frame[i])) {
+                parsed_ok = true;
+            }
+        }
+        assert(parsed_ok);
+        g_lua_harness.tx_frames.push_back(frame);
+
+        /* Automatically generate the real C++ 0x7B response frame just like firmware process_crsf_rns_frame() */
+        uint8_t subcmd = 0U;
+        const uint8_t *cmd_pay = NULL;
+        size_t cmd_pay_len = 0U;
+        if (crsf_decode_rns_cmd_frame(frame.data(), frame.size(), NULL, NULL, &subcmd, &cmd_pay, &cmd_pay_len)) {
+            uint8_t resp[64];
+            size_t rlen = 0U;
+            if (subcmd == CRSF_RNS_SUBCMD_GET_STATUS) {
+                rlen = crsf_build_rns_status_frame(&g_lua_harness.sim_status, resp);
+            } else if (subcmd == CRSF_RNS_SUBCMD_GET_PEER) {
+                rlen = crsf_build_rns_peer_frame(&g_lua_harness.sim_peer, resp);
+            } else {
+                rlen = crsf_build_rns_ack_frame(subcmd, 0U, resp);
+            }
+            if (rlen > 0U) {
+                g_lua_harness.rx_frames.push_back(std::vector<uint8_t>(resp, resp + rlen));
+            }
+        }
+    }
+    return 0;
+}
+
+static int host_crsf_rx_to_lua(lua_State *L) {
+    if (g_lua_harness.rx_frames.empty()) {
+        p_lua_pushnil(L);
+        return 1;
+    }
+    std::vector<uint8_t> frame = g_lua_harness.rx_frames.front();
+    g_lua_harness.rx_frames.erase(g_lua_harness.rx_frames.begin());
+    /* Validate frame CRC before passing [cmd, payload...] to Lua */
+    uint8_t flen = frame[1];
+    assert((size_t)(flen + 2U) == frame.size());
+    assert(crsf_crc8(&frame[2], (size_t)(flen - 1U)) == frame.back());
+    /* Pass [type, payload...] (excluding trailing CRC8) */
+    p_lua_pushlstring(L, (const char *)&frame[2], frame.size() - 3U);
+    return 1;
+}
+
+static int host_lcd_clear(lua_State *) {
+    g_lua_harness.lcd_lines.clear();
+    return 0;
+}
+
+static int host_lcd_draw_text(lua_State *L) {
+    size_t len = 0;
+    const char *s = p_lua_tolstring(L, 1, &len);
+    if (s) {
+        g_lua_harness.lcd_lines.push_back(std::string(s, len));
+    }
+    return 0;
+}
+
+static bool lcd_contains(const char *substr) {
+    for (const auto &line : g_lua_harness.lcd_lines) {
+        if (line.find(substr) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void test_edgetx_lua_script_end_to_end(void) {
+    void *dl = dlopen("liblua5.2.so.0", RTLD_LAZY);
+    assert(dl != NULL && "liblua5.2.so.0 required for EdgeTX Lua 5.2 integration test");
+
+    p_luaL_newstate   = (lua_State *(*)(void))dlsym(dl, "luaL_newstate");
+    p_luaL_openlibs   = (void (*)(lua_State *))dlsym(dl, "luaL_openlibs");
+    p_luaL_loadstring = (int (*)(lua_State *, const char *))dlsym(dl, "luaL_loadstring");
+    p_lua_pcallk      = (int (*)(lua_State *, int, int, int, int, lua_CFunction))dlsym(dl, "lua_pcallk");
+    p_lua_pushcclosure= (void (*)(lua_State *, lua_CFunction, int))dlsym(dl, "lua_pushcclosure");
+    p_lua_setglobal   = (void (*)(lua_State *, const char *))dlsym(dl, "lua_setglobal");
+    p_lua_pushlstring = (void (*)(lua_State *, const char *, size_t))dlsym(dl, "lua_pushlstring");
+    p_lua_pushnil     = (void (*)(lua_State *))dlsym(dl, "lua_pushnil");
+    p_lua_tolstring   = (const char *(*)(lua_State *, int, size_t *))dlsym(dl, "lua_tolstring");
+    p_lua_close       = (void (*)(lua_State *))dlsym(dl, "lua_close");
+    assert(p_luaL_newstate && p_luaL_openlibs && p_luaL_loadstring && p_lua_pcallk);
+
+    g_lua_harness.tx_frames.clear();
+    g_lua_harness.rx_frames.clear();
+    g_lua_harness.lcd_lines.clear();
+
+    /* Build real C++ Reticulum identities, status frame, peer frame, ACK frame, and FLIGHT_MODE frame */
+    uint8_t uid[6];
+    elrs_uid_from_bind_phrase("lr2021-elrs-demo", uid);
+    const uint8_t hw_tx[8] = {0xFC, 0x6D, 0x1A, 0x37, 0x11, 0x22, 0x33, 0x44};
+    const uint8_t hw_rx[8] = {0xD5, 0x6B, 0x69, 0x41, 0x55, 0x66, 0x77, 0x88};
+    rns_node_identity_t tx_id, rx_id;
+    rns_identity_init(&tx_id, hw_tx, uid, RNS_NODE_ROLE_TX, "LR2021-TX");
+    rns_identity_init(&rx_id, hw_rx, uid, RNS_NODE_ROLE_RX, "LR2021-RX");
+
+    crsf_rns_status_t st = {};
+    memcpy(st.tx_dest, tx_id.dest_hash, 16U);
+    memcpy(st.rx_dest, rx_id.dest_hash, 16U);
+    st.app_mode         = 2U; /* ELRS_TX */
+    st.lock_state       = 2U; /* LOCKED */
+    st.elrs_rate_idx    = 3U;
+    st.ifac_enabled     = true;
+    st.rnode_freq_hz    = 915000000UL; /* Preset #3 (915.000 MHz) */
+    st.rnode_bw_khz     = 250U;        /* Preset #2 (250.0 kHz) */
+    st.rnode_sf         = 8U;
+    st.rnode_cr         = 6U;
+    st.rnode_txpower    = 17;
+    st.peer_count       = 1U;
+    st.selected_peer    = 0U;
+    st.last_ping_rtt_ms = 34U;
+    st.tx_msgs          = 19U;
+    st.rx_msgs          = 18U;
+    st.relayed_msgs     = 5U;
+    g_lua_harness.sim_status = st;
+
+    crsf_rns_peer_info_t pi = {};
+    pi.peer_idx    = 0U;
+    pi.total_peers = 1U;
+    pi.is_selected = true;
+    pi.role        = RNS_NODE_ROLE_RX;
+    memcpy(pi.dest_hash, rx_id.dest_hash, 16U);
+    strcpy(pi.name, "LR2021-RX");
+    pi.hops        = 2U;
+    pi.rssi_dbm    = -58;
+    pi.snr_db      = 9;
+    pi.armed       = true;
+    pi.custom_mode = 5U;
+    pi.vbatt_mv    = 25200U;
+    pi.age_s       = 1U;
+    g_lua_harness.sim_peer = pi;
+
+    uint8_t buf[64];
+    size_t len = crsf_build_flight_mode_frame("RNS:4cef..c149 1p", buf);
+    g_lua_harness.rx_frames.push_back(std::vector<uint8_t>(buf, buf + len));
+
+    lua_State *L = p_luaL_newstate();
+    p_luaL_openlibs(L);
+    p_lua_pushcclosure(L, host_crsf_tx_from_lua, 0);
+    p_lua_setglobal(L, "__host_crsf_tx");
+    p_lua_pushcclosure(L, host_crsf_rx_to_lua, 0);
+    p_lua_setglobal(L, "__host_crsf_rx");
+    p_lua_pushcclosure(L, host_lcd_clear, 0);
+    p_lua_setglobal(L, "__host_lcd_clear");
+    p_lua_pushcclosure(L, host_lcd_draw_text, 0);
+    p_lua_setglobal(L, "__host_lcd_draw_text");
+
+    const char *lua_driver = R"LUA(
+      LCD_W = 480
+      LCD_H = 272
+      BOLD = 1
+      INVERS = 2
+      BLINK = 4
+      SOLID = 0
+      EVT_VIRTUAL_NEXT_PAGE = 101
+      EVT_VIRTUAL_PREV_PAGE = 102
+      EVT_PAGE_BREAK        = 103
+      EVT_VIRTUAL_NEXT      = 104
+      EVT_VIRTUAL_PREV      = 105
+      EVT_VIRTUAL_ENTER     = 106
+      EVT_VIRTUAL_EXIT      = 107
+
+      local sim_time_10ms = 100
+      function getTime()
+        return sim_time_10ms
+      end
+      function advanceTimeMs(ms)
+        sim_time_10ms = sim_time_10ms + math.floor(ms / 10)
+      end
+
+      lcd = {
+        clear = function() __host_lcd_clear() end,
+        drawText = function(x, y, s, attr) __host_lcd_draw_text(tostring(s)) end,
+        drawLine = function(x1, y1, x2, y2, pat, flg) end
+      }
+
+      function crossfireTelemetryPush(cmd, payload)
+        local chars = { string.char(cmd) }
+        for i = 1, #payload do
+          chars[#chars + 1] = string.char(payload[i])
+        end
+        __host_crsf_tx(table.concat(chars))
+        return true
+      end
+
+      function crossfireTelemetryPop()
+        local raw = __host_crsf_rx()
+        if not raw or #raw < 1 then return nil, nil end
+        local cmd = string.byte(raw, 1)
+        local data = {}
+        for i = 2, #raw do
+          data[#data + 1] = string.byte(raw, i)
+        end
+        return cmd, data
+      end
+
+      tool = dofile("tools/rns_elrs.lua")
+      tool.init()
+      -- 1. Page 1: Pop RESP_STATUS + FLIGHT_MODE and render Page 1
+      tool.run(0)
+    )LUA";
+
+    int rc = p_luaL_loadstring(L, lua_driver);
+    assert(rc == 0);
+    rc = p_lua_pcallk(L, 0, 0, 0, 0, NULL);
+    if (rc != 0) {
+        size_t elen = 0;
+        const char *err = p_lua_tolstring(L, -1, &elen);
+        fprintf(stderr, "Lua error: %s\n", err ? err : "unknown");
+        assert(rc == 0);
+    }
+
+    /* Verify init() sent SUBCMD_GET_STATUS (0x01) to 0xEE (TX Module) */
+    assert(!g_lua_harness.tx_frames.empty());
+    uint8_t dest = 0, orig = 0, subcmd = 0;
+    const uint8_t *pay = NULL;
+    size_t pay_len = 0;
+    assert(crsf_decode_rns_cmd_frame(g_lua_harness.tx_frames[0].data(), g_lua_harness.tx_frames[0].size(),
+                                     &dest, &orig, &subcmd, &pay, &pay_len));
+    assert(dest == CRSF_ADDRESS_CRSF_TRANSMITTER && orig == CRSF_ADDRESS_HANDSET);
+    assert(subcmd == CRSF_RNS_SUBCMD_GET_STATUS && pay_len == 0U);
+
+    /* Verify Page 1 rendered the decoded C++ status & 0x21 FLIGHT_MODE string */
+    assert(lcd_contains("Mode:ELRS_TX(LOCKED) Peers:1 RTT:34ms"));
+    assert(lcd_contains("RNS:4cef..c149 1p"));
+    assert(lcd_contains("[TX-MOD(0xEE)]"));
+
+    /* 2. Test Page 1 buttons: [Pair & Sync RX], [Announce], and [OTA-RX(0xEC)] toggle */
+    g_lua_harness.tx_frames.clear();
+    const char *lua_page1_actions = R"LUA(
+      -- Cursor 1: [Pair & Sync RX]
+      tool.run(EVT_VIRTUAL_ENTER)
+      -- Cursor 2: [Announce]
+      tool.run(EVT_VIRTUAL_NEXT)
+      tool.run(EVT_VIRTUAL_ENTER)
+      -- Cursor 3: Toggle [OTA-RX(0xEC)] and trigger Announce addressed to 0xEC
+      tool.run(EVT_VIRTUAL_NEXT)
+      tool.run(EVT_VIRTUAL_ENTER)
+      tool.run(EVT_VIRTUAL_PREV)
+      tool.run(EVT_VIRTUAL_ENTER)
+    )LUA";
+    assert(p_luaL_loadstring(L, lua_page1_actions) == 0);
+    assert(p_lua_pcallk(L, 0, 0, 0, 0, NULL) == 0);
+    assert(g_lua_harness.tx_frames.size() == 3U);
+
+    /* Frame 0: SUBCMD_PAIR_RX to 0xEE */
+    assert(crsf_decode_rns_cmd_frame(g_lua_harness.tx_frames[0].data(), g_lua_harness.tx_frames[0].size(),
+                                     &dest, &orig, &subcmd, &pay, &pay_len));
+    assert(dest == CRSF_ADDRESS_CRSF_TRANSMITTER && subcmd == CRSF_RNS_SUBCMD_PAIR_RX);
+
+    /* Frame 1: SUBCMD_ACTION(ACT_ANNOUNCE) to 0xEE */
+    assert(crsf_decode_rns_cmd_frame(g_lua_harness.tx_frames[1].data(), g_lua_harness.tx_frames[1].size(),
+                                     &dest, &orig, &subcmd, &pay, &pay_len));
+    assert(dest == CRSF_ADDRESS_CRSF_TRANSMITTER && subcmd == CRSF_RNS_SUBCMD_ACTION && pay_len == 1U && pay[0] == CRSF_RNS_ACT_ANNOUNCE);
+
+    /* Frame 2: SUBCMD_ACTION(ACT_ANNOUNCE) tunneled over-the-air to 0xEC (CRSF_ADDRESS_CRSF_RECEIVER) */
+    assert(crsf_decode_rns_cmd_frame(g_lua_harness.tx_frames[2].data(), g_lua_harness.tx_frames[2].size(),
+                                     &dest, &orig, &subcmd, &pay, &pay_len));
+    assert(dest == CRSF_ADDRESS_CRSF_RECEIVER && subcmd == CRSF_RNS_SUBCMD_ACTION && pay_len == 1U && pay[0] == CRSF_RNS_ACT_ANNOUNCE);
+    assert(lcd_contains("[OTA-RX(0xEC)]"));
+
+    /* 3. Switch to Page 2: Verify initial sync from C++ status (915.000 MHz, 250.0 kHz, SF8, CR 4/6, 17dBm, IFAC ON),
+     * then edit Freq -> 2440.000 MHz, BW -> 500.0 kHz, SF -> 9, CR -> 4/7, Pwr -> 18 dBm, IFAC -> OFF, and Apply!
+     */
+    g_lua_harness.tx_frames.clear();
+    const char *lua_page2 = R"LUA(
+      tool.run(EVT_VIRTUAL_NEXT_PAGE)
+    )LUA";
+    assert(p_luaL_loadstring(L, lua_page2) == 0);
+    assert(p_lua_pcallk(L, 0, 0, 0, 0, NULL) == 0);
+    assert(lcd_contains("1. Freq: 915.000 MHz"));
+    assert(lcd_contains("2. BW:   250.0 kHz"));
+    assert(lcd_contains("3. SF: SF8"));
+    assert(lcd_contains("4. CR: 4/6"));
+    assert(lcd_contains("5. Pwr: 17dBm"));
+    assert(lcd_contains("6. IFAC: ON"));
+
+    const char *lua_page2_edit = R"LUA(
+      -- 1. Edit Freq: 915 MHz (#3) -> 2440 MHz (#4)
+      tool.run(EVT_VIRTUAL_ENTER)
+      tool.run(EVT_VIRTUAL_NEXT)
+      tool.run(EVT_VIRTUAL_ENTER)
+      -- 2. Edit BW: 250 kHz (#2) -> 500 kHz (#3)
+      tool.run(EVT_VIRTUAL_NEXT)
+      tool.run(EVT_VIRTUAL_ENTER)
+      tool.run(EVT_VIRTUAL_NEXT)
+      tool.run(EVT_VIRTUAL_ENTER)
+      -- 3. Edit SF: 8 -> 9
+      tool.run(EVT_VIRTUAL_NEXT)
+      tool.run(EVT_VIRTUAL_ENTER)
+      tool.run(EVT_VIRTUAL_NEXT)
+      tool.run(EVT_VIRTUAL_ENTER)
+      -- 4. Edit CR: 6 -> 7
+      tool.run(EVT_VIRTUAL_NEXT)
+      tool.run(EVT_VIRTUAL_ENTER)
+      tool.run(EVT_VIRTUAL_NEXT)
+      tool.run(EVT_VIRTUAL_ENTER)
+      -- 5. Edit Pwr: 17 -> 18 dBm
+      tool.run(EVT_VIRTUAL_NEXT)
+      tool.run(EVT_VIRTUAL_ENTER)
+      tool.run(EVT_VIRTUAL_NEXT)
+      tool.run(EVT_VIRTUAL_ENTER)
+      -- 6. Edit IFAC: ON -> OFF
+      tool.run(EVT_VIRTUAL_NEXT)
+      tool.run(EVT_VIRTUAL_ENTER)
+      tool.run(EVT_VIRTUAL_NEXT)
+      tool.run(EVT_VIRTUAL_ENTER)
+      -- 7. [Apply & Push OTA to RX]
+      tool.run(EVT_VIRTUAL_NEXT)
+      tool.run(EVT_VIRTUAL_ENTER)
+    )LUA";
+    assert(p_luaL_loadstring(L, lua_page2_edit) == 0);
+    assert(p_lua_pcallk(L, 0, 0, 0, 0, NULL) == 0);
+    assert(g_lua_harness.tx_frames.size() == 2U);
+
+    crsf_rns_cfg_cmd_t lua_cfg = {};
+    assert(crsf_decode_rns_set_cfg_frame(g_lua_harness.tx_frames[0].data(), g_lua_harness.tx_frames[0].size(), &lua_cfg));
+    assert(lua_cfg.freq_hz == 2440000000UL);
+    assert(lua_cfg.bw_hz == 500000UL);
+    assert(lua_cfg.sf == 9U);
+    assert(lua_cfg.cr == 7U);
+    assert(lua_cfg.txpower_dbm == 18);
+    assert(!lua_cfg.ifac_enabled);
+
+    assert(crsf_decode_rns_cmd_frame(g_lua_harness.tx_frames[1].data(), g_lua_harness.tx_frames[1].size(),
+                                     &dest, &orig, &subcmd, &pay, &pay_len));
+    assert(subcmd == CRSF_RNS_SUBCMD_PAIR_RX);
+
+    /* 4. Switch to Page 3 (Mesh Peers): verify round-robin GET_PEER poll, peer rendering (2h, -58dBm, 25.2V), and SELECT_PEER */
+    g_lua_harness.tx_frames.clear();
+    const char *lua_page3 = R"LUA(
+      LCD_W = 128 -- Also verify B&W 128x64 layout rendering
+      advanceTimeMs(400)
+      tool.run(EVT_VIRTUAL_NEXT_PAGE)
+      tool.run(EVT_VIRTUAL_ENTER)
+    )LUA";
+    assert(p_luaL_loadstring(L, lua_page3) == 0);
+    assert(p_lua_pcallk(L, 0, 0, 0, 0, NULL) == 0);
+    assert(lcd_contains("2h -58dBm 25.2V"));
+    assert(g_lua_harness.tx_frames.size() == 2U);
+    /* First frame is periodic SUBCMD_GET_PEER(0), second is SUBCMD_SELECT_PEER(0) */
+    assert(crsf_decode_rns_cmd_frame(g_lua_harness.tx_frames[0].data(), g_lua_harness.tx_frames[0].size(),
+                                     &dest, &orig, &subcmd, &pay, &pay_len));
+    assert(subcmd == CRSF_RNS_SUBCMD_GET_PEER && pay_len == 1U && pay[0] == 0U);
+    assert(crsf_decode_rns_cmd_frame(g_lua_harness.tx_frames[1].data(), g_lua_harness.tx_frames[1].size(),
+                                     &dest, &orig, &subcmd, &pay, &pay_len));
+    assert(subcmd == CRSF_RNS_SUBCMD_SELECT_PEER && pay_len == 1U && pay[0] == 0U);
+
+    /* 5. Switch to Page 4 (Targeted RX Cmd): press all 6 action buttons (Ping RX, LOITER, RTL, LAND, ARM, DISARM) */
+    g_lua_harness.tx_frames.clear();
+    const char *lua_page4 = R"LUA(
+      LCD_W = 480
+      tool.run(EVT_VIRTUAL_NEXT_PAGE)
+      for i = 1, 6 do
+        tool.run(EVT_VIRTUAL_ENTER)
+        tool.run(EVT_VIRTUAL_NEXT)
+      end
+    )LUA";
+    assert(p_luaL_loadstring(L, lua_page4) == 0);
+    assert(p_lua_pcallk(L, 0, 0, 0, 0, NULL) == 0);
+    assert(lcd_contains("Ping RTT:34ms  TunTX:19 TunRX:18 Rly:5"));
+    assert(lcd_contains("OK (0x06)"));
+    assert(g_lua_harness.tx_frames.size() == 6U);
+    const uint8_t expected_acts[6] = {
+        CRSF_RNS_ACT_PING, CRSF_RNS_ACT_LOITER, CRSF_RNS_ACT_RTL,
+        CRSF_RNS_ACT_LAND, CRSF_RNS_ACT_ARM,    CRSF_RNS_ACT_DISARM
+    };
+    for (int i = 0; i < 6; i++) {
+        assert(crsf_decode_rns_cmd_frame(g_lua_harness.tx_frames[i].data(), g_lua_harness.tx_frames[i].size(),
+                                         &dest, &orig, &subcmd, &pay, &pay_len));
+        assert(subcmd == CRSF_RNS_SUBCMD_ACTION && pay_len == 1U && pay[0] == expected_acts[i]);
+    }
+
+    p_lua_close(L);
+    dlclose(dl);
+    printf("[PASS] test_edgetx_lua_script_end_to_end (Lua 5.2 VM executing tools/rns_elrs.lua Pages 1..4 <-> C++ CRSF 0x7A/0x7B/0x21)\n");
 }
 
 int main(void) {
@@ -677,6 +1137,7 @@ int main(void) {
     test_fc_mavlink_and_beacons();
     test_elrs_data_tunnel();
     test_rns_identity_pairing_and_lua_crsf();
+    test_edgetx_lua_script_end_to_end();
     printf("All host unit tests PASSED.\n");
     return 0;
 }

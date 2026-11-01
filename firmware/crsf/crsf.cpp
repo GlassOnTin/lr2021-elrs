@@ -406,6 +406,19 @@ size_t crsf_build_rns_ack_frame(uint8_t subcmd, uint8_t status_code, uint8_t out
     return 9U;
 }
 
+bool crsf_decode_rns_ack_frame(const uint8_t *frame, size_t frame_len, uint8_t *out_subcmd, uint8_t *out_status_code) {
+    if (frame == NULL || frame_len < 9U) return false;
+    if (frame[1] != 7U || frame[2] != CRSF_FRAMETYPE_RNS_TLM || frame[5] != CRSF_RNS_RESP_ACK) {
+        return false;
+    }
+    if (crsf_crc8(&frame[2], 6U) != frame[8]) {
+        return false;
+    }
+    if (out_subcmd != NULL) *out_subcmd = frame[6];
+    if (out_status_code != NULL) *out_status_code = frame[7];
+    return true;
+}
+
 size_t crsf_build_rns_cmd_frame(uint8_t subcmd, const uint8_t *payload, size_t pay_len, uint8_t out_frame[CRSF_MAX_FRAME_LEN]) {
     if (out_frame == NULL || (pay_len + 7U) > CRSF_MAX_FRAME_LEN) return 0U;
     out_frame[0] = CRSF_ADDRESS_CRSF_TRANSMITTER;
@@ -419,4 +432,49 @@ size_t crsf_build_rns_cmd_frame(uint8_t subcmd, const uint8_t *payload, size_t p
     }
     out_frame[6U + pay_len] = crsf_crc8(&out_frame[2], 4U + pay_len);
     return 7U + pay_len;
+}
+
+bool crsf_decode_rns_cmd_frame(const uint8_t *frame,
+                               size_t frame_len,
+                               uint8_t *out_dest_addr,
+                               uint8_t *out_orig_addr,
+                               uint8_t *out_subcmd,
+                               const uint8_t **out_payload,
+                               size_t *out_pay_len) {
+    if (frame == NULL || frame_len < 7U) return false;
+    uint8_t flen = frame[1];
+    if ((size_t)(flen + 2U) > frame_len || flen < 5U || frame[2] != CRSF_FRAMETYPE_RNS_CMD) {
+        return false;
+    }
+    if (crsf_crc8(&frame[2], (size_t)(flen - 1U)) != frame[flen + 1U]) {
+        return false;
+    }
+    if (out_dest_addr != NULL) *out_dest_addr = frame[3];
+    if (out_orig_addr != NULL) *out_orig_addr = frame[4];
+    if (out_subcmd != NULL)    *out_subcmd    = frame[5];
+    size_t plen = (size_t)(flen - 5U);
+    if (out_payload != NULL)   *out_payload   = (plen > 0U) ? &frame[6] : NULL;
+    if (out_pay_len != NULL)   *out_pay_len   = plen;
+    return true;
+}
+
+bool crsf_decode_rns_set_cfg_frame(const uint8_t *frame, size_t frame_len, crsf_rns_cfg_cmd_t *out_cfg) {
+    if (out_cfg == NULL) return false;
+    uint8_t subcmd = 0U;
+    const uint8_t *pay = NULL;
+    size_t pay_len = 0U;
+    if (!crsf_decode_rns_cmd_frame(frame, frame_len, NULL, NULL, &subcmd, &pay, &pay_len)) {
+        return false;
+    }
+    if (subcmd != CRSF_RNS_SUBCMD_SET_CFG || pay == NULL || pay_len < 12U) {
+        return false;
+    }
+    memset(out_cfg, 0, sizeof(*out_cfg));
+    out_cfg->freq_hz      = read_be32(&pay[0]);
+    out_cfg->bw_hz        = read_be32(&pay[4]);
+    out_cfg->sf           = pay[8];
+    out_cfg->cr           = pay[9];
+    out_cfg->txpower_dbm  = (int8_t)pay[10];
+    out_cfg->ifac_enabled = (pay[11] != 0U);
+    return true;
 }

@@ -190,6 +190,18 @@ local function pollTelemetry()
         state.relay_fwd_cnt = u16be(data, 57)
 
         if not state.cfg_synced then
+          for fi = 1, #FREQ_PRESETS do
+            if FREQ_PRESETS[fi] == state.rnode_freq_hz then
+              state.cfg_freq_idx = fi
+              break
+            end
+          end
+          for bi = 1, #BW_Presets do
+            if BW_Presets[bi] == state.rnode_bw_hz then
+              state.cfg_bw_idx = bi
+              break
+            end
+          end
           state.cfg_sf     = state.rnode_sf
           state.cfg_cr     = state.rnode_cr
           state.cfg_txpwr  = state.tx_power_dbm
@@ -219,6 +231,9 @@ local function pollTelemetry()
       end
     elseif cmd == CRSF_TLM_FM and #data >= 4 then
       state.fm_str = bytesToAscii(data, 1, 28)
+      if state.fm_str ~= "" then
+        state.status_msg = state.fm_str
+      end
     end
   end
 
@@ -277,6 +292,7 @@ local function drawPage2()
   drawHeader("RNode LoRa Config")
   local y = (LCD_W >= 320) and 32 or 10
   local dy = (LCD_W >= 320) and 22 or 9
+  local x2 = (LCD_W >= 320) and 145 or 68
 
   local fMhz = (FREQ_PRESETS[state.cfg_freq_idx] or state.rnode_freq_hz) / 1000000.0
   local bwKhz = (BW_Presets[state.cfg_bw_idx] or state.rnode_bw_hz) / 1000.0
@@ -290,11 +306,13 @@ local function drawPage2()
   y = y + dy
   lcd.drawText(6, y, string.format("2. BW:   %.1f kHz", bwKhz), attr(2))
   y = y + dy
-  lcd.drawText(6, y, string.format("3. SF/CR: SF%d CR4/%d", state.cfg_sf, state.cfg_cr), attr(3))
+  lcd.drawText(6, y, string.format("3. SF: SF%d", state.cfg_sf), attr(3))
+  lcd.drawText(x2, y, string.format("4. CR: 4/%d", state.cfg_cr), attr(4))
   y = y + dy
-  lcd.drawText(6, y, string.format("4. Power: %d dBm  IFAC:%s", state.cfg_txpwr, state.cfg_ifac == 1 and "ON" or "OFF"), attr(4))
+  lcd.drawText(6, y, string.format("5. Pwr: %ddBm", state.cfg_txpwr), attr(5))
+  lcd.drawText(x2, y, string.format("6. IFAC: %s", state.cfg_ifac == 1 and "ON" or "OFF"), attr(6))
   y = y + dy
-  lcd.drawText(6, y, "[Apply & Push OTA to RX]", attr(5))
+  lcd.drawText(6, y, "[Apply & Push OTA to RX]", attr(7))
 end
 
 local function drawPage3()
@@ -370,7 +388,7 @@ local function handleEvent(event)
   end
 
   local maxCursor = 3
-  if state.page == 2 then maxCursor = 5
+  if state.page == 2 then maxCursor = 7
   elseif state.page == 3 then maxCursor = math.max(1, state.peer_count)
   elseif state.page == 4 then maxCursor = 6 end
 
@@ -379,7 +397,9 @@ local function handleEvent(event)
       if state.cursor == 1 then state.cfg_freq_idx = (state.cfg_freq_idx % #FREQ_PRESETS) + 1
       elseif state.cursor == 2 then state.cfg_bw_idx = (state.cfg_bw_idx % #BW_Presets) + 1
       elseif state.cursor == 3 then state.cfg_sf = math.min(12, state.cfg_sf + 1)
-      elseif state.cursor == 4 then state.cfg_ifac = 1 - state.cfg_ifac end
+      elseif state.cursor == 4 then state.cfg_cr = math.min(8, state.cfg_cr + 1)
+      elseif state.cursor == 5 then state.cfg_txpwr = math.min(22, state.cfg_txpwr + 1)
+      elseif state.cursor == 6 then state.cfg_ifac = 1 - state.cfg_ifac end
     else
       state.cursor = (state.cursor % maxCursor) + 1
     end
@@ -388,7 +408,9 @@ local function handleEvent(event)
       if state.cursor == 1 then state.cfg_freq_idx = ((state.cfg_freq_idx - 2) % #FREQ_PRESETS) + 1
       elseif state.cursor == 2 then state.cfg_bw_idx = ((state.cfg_bw_idx - 2) % #BW_Presets) + 1
       elseif state.cursor == 3 then state.cfg_sf = math.max(5, state.cfg_sf - 1)
-      elseif state.cursor == 4 then state.cfg_ifac = 1 - state.cfg_ifac end
+      elseif state.cursor == 4 then state.cfg_cr = math.max(5, state.cfg_cr - 1)
+      elseif state.cursor == 5 then state.cfg_txpwr = math.max(-10, state.cfg_txpwr - 1)
+      elseif state.cursor == 6 then state.cfg_ifac = 1 - state.cfg_ifac end
     else
       state.cursor = ((state.cursor - 2) % maxCursor) + 1
     end
@@ -405,7 +427,7 @@ local function handleEvent(event)
         state.status_msg = state.ota_rx_direct and "Target: OTA RX" or "Target: TX Mod"
       end
     elseif state.page == 2 then
-      if state.cursor == 5 then
+      if state.cursor == 7 then
         pushConfigToModule(true)
       else
         state.editing = not state.editing
