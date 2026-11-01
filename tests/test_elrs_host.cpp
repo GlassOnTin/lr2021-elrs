@@ -640,7 +640,30 @@ static void test_rns_identity_pairing_and_lua_crsf(void) {
     assert(memcmp(pi_out.dest_hash, rx_id.dest_hash, 16U) == 0);
     assert(strcmp(pi_out.name, "LR2021-RX") == 0);
 
-    printf("[PASS] test_rns_identity_pairing_and_lua_crsf (SHA-256, 16B SINGLE dest_hash, RNSA/RNSP/RNSC, CRSF 0x7A/0x7B)\n");
+    /* 7. Verify CRSF 0x21 FLIGHT_MODE telemetry string round-trip & 0xEC receiver address parsing */
+    uint8_t fm_buf[64] = {0};
+    size_t fm_len = crsf_build_flight_mode_frame("RNS:4cef..c149 1p", fm_buf);
+    assert(fm_len == 22U);
+    char fm_dec[32] = {0};
+    assert(crsf_decode_flight_mode_frame(fm_buf, fm_len, fm_dec, sizeof(fm_dec)));
+    assert(strcmp(fm_dec, "RNS:4cef..c149 1p") == 0);
+
+    uint8_t cmd_buf[32] = {0};
+    size_t cmd_len = crsf_build_rns_cmd_frame(CRSF_RNS_SUBCMD_GET_STATUS, NULL, 0U, cmd_buf);
+    cmd_buf[0] = CRSF_ADDRESS_CRSF_RECEIVER;
+    cmd_buf[3] = CRSF_ADDRESS_CRSF_RECEIVER;
+    cmd_buf[cmd_len - 1U] = crsf_crc8(&cmd_buf[2], cmd_len - 3U);
+    crsf_parser_t rx_p;
+    crsf_parser_init(&rx_p);
+    bool got_rx_cmd = false;
+    for (size_t i = 0U; i < cmd_len; i++) {
+        if (crsf_parser_feed_byte(&rx_p, cmd_buf[i])) {
+            got_rx_cmd = true;
+        }
+    }
+    assert(got_rx_cmd && rx_p.buf[0] == CRSF_ADDRESS_CRSF_RECEIVER && rx_p.buf[2] == CRSF_FRAMETYPE_RNS_CMD);
+
+    printf("[PASS] test_rns_identity_pairing_and_lua_crsf (SHA-256, 16B SINGLE dest_hash, RNSA/RNSP/RNSC, CRSF 0x7A/0x7B/0x21)\n");
 }
 
 int main(void) {

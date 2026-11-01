@@ -14,10 +14,12 @@
 --   Page 3: Discovered Reticulum Mesh Peers (RNSA Announces, Hops, RSSI, VBatt)
 --   Page 4: Targeted Receiver Commands & Mesh Ping/Pong RTT (RNSC)
 
-local CRSF_ADDR_HANDSET = 0xEA
-local CRSF_ADDR_MODULE  = 0xEE
-local CRSF_CMD_RNS      = 0x7A
-local CRSF_TLM_RNS      = 0x7B
+local CRSF_ADDR_HANDSET  = 0xEA
+local CRSF_ADDR_RECEIVER = 0xEC
+local CRSF_ADDR_MODULE   = 0xEE
+local CRSF_CMD_RNS       = 0x7A
+local CRSF_TLM_RNS       = 0x7B
+local CRSF_TLM_FM        = 0x21
 
 local SUBCMD_GET_STATUS  = 0x01
 local SUBCMD_GET_PEER    = 0x02
@@ -77,6 +79,8 @@ local state = {
   cfg_txpwr     = 14,
   cfg_ifac      = 0,
   cfg_synced    = false,
+  ota_rx_direct = false,
+  fm_str        = "",
 
   peers = {}
 }
@@ -119,7 +123,8 @@ local function i8(val)
 end
 
 local function sendRnsCmd(subcmd, args)
-  local payload = { CRSF_ADDR_MODULE, CRSF_ADDR_HANDSET, subcmd }
+  local dest = state.ota_rx_direct and CRSF_ADDR_RECEIVER or CRSF_ADDR_MODULE
+  local payload = { dest, CRSF_ADDR_HANDSET, subcmd }
   if args then
     for i = 1, #args do
       payload[#payload + 1] = args[i]
@@ -212,6 +217,8 @@ local function pollTelemetry()
         local status    = data[5]
         state.status_msg = string.format("%s (0x%02X)", status == 0 and "OK" or "ERR", ackSubcmd)
       end
+    elseif cmd == CRSF_TLM_FM and #data >= 4 then
+      state.fm_str = bytesToAscii(data, 1, 28)
     end
   end
 
@@ -259,8 +266,11 @@ local function drawPage1()
 
   local a1 = (state.cursor == 1) and INVERS or 0
   local a2 = (state.cursor == 2) and INVERS or 0
+  local a3 = (state.cursor == 3) and INVERS or 0
+  local tgt = state.ota_rx_direct and "OTA-RX(0xEC)" or "TX-MOD(0xEE)"
   lcd.drawText(6, y, "[Pair & Sync RX]", a1)
-  lcd.drawText((LCD_W >= 320) and 180 or 72, y, "[Announce TX]", a2)
+  lcd.drawText((LCD_W >= 320) and 165 or 68, y, "[Announce]", a2)
+  lcd.drawText((LCD_W >= 320) and 285 or 106, y, "[" .. tgt .. "]", a3)
 end
 
 local function drawPage2()
@@ -359,7 +369,7 @@ local function handleEvent(event)
     return 0
   end
 
-  local maxCursor = 2
+  local maxCursor = 3
   if state.page == 2 then maxCursor = 5
   elseif state.page == 3 then maxCursor = math.max(1, state.peer_count)
   elseif state.page == 4 then maxCursor = 6 end
@@ -387,9 +397,12 @@ local function handleEvent(event)
       if state.cursor == 1 then
         sendRnsCmd(SUBCMD_PAIR_RX, nil)
         state.status_msg = "Pairing RX OTA..."
-      else
+      elseif state.cursor == 2 then
         sendRnsCmd(SUBCMD_ACTION, { ACT_ANNOUNCE })
-        state.status_msg = "TX Announce Sent"
+        state.status_msg = "Announce Sent"
+      else
+        state.ota_rx_direct = not state.ota_rx_direct
+        state.status_msg = state.ota_rx_direct and "Target: OTA RX" or "Target: TX Mod"
       end
     elseif state.page == 2 then
       if state.cursor == 5 then

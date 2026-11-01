@@ -15,6 +15,7 @@ extern "C" {
 
 #define CRSF_SYNC_BYTE                  0xC8U
 #define CRSF_ADDRESS_HANDSET            0xEAU
+#define CRSF_ADDRESS_CRSF_RECEIVER      0xECU
 #define CRSF_ADDRESS_CRSF_TRANSMITTER   0xEEU
 #define CRSF_ADDRESS_FLIGHT_CONTROLLER  0xC8U
 #define CRSF_MAX_FRAME_LEN              64U
@@ -131,6 +132,10 @@ bool crsf_parser_feed_byte(crsf_parser_t *parser, uint8_t byte);
 
 /* Build CRSF_FRAMETYPE_DEVICE_INFO (0x29) response for EdgeTX Lua discovery */
 size_t crsf_build_device_info_frame(const char *device_name, uint32_t serial_no, uint8_t out_frame[CRSF_MAX_FRAME_LEN]);
+
+/* Build & decode CRSF_FRAMETYPE_FLIGHT_MODE (0x21) standard telemetry string frame (e.g. "RNS:4cef..c149 1p") */
+size_t crsf_build_flight_mode_frame(const char *fm_str, uint8_t out_frame[CRSF_MAX_FRAME_LEN]);
+bool   crsf_decode_flight_mode_frame(const uint8_t *frame, size_t frame_len, char *out_str, size_t max_len);
 
 /* Build & decode CRSF_FRAMETYPE_RNS_TLM (0x7B) extended frames for EdgeTX Lua script */
 size_t crsf_build_rns_status_frame(const crsf_rns_status_t *st, uint8_t out_frame[CRSF_MAX_FRAME_LEN]);

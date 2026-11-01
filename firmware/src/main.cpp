@@ -49,6 +49,9 @@ static uint16_t            g_rc_channels[ELRS_NUM_CHANNELS];
 static bool                g_rc_is_armed       = false;
 static volatile bool       g_crsf_rc_pending   = false;
 static crsf_parser_t       g_crsf_parser;
+static crsf_parser_t       g_usb_crsf_parser;
+static uint8_t             g_last_aux7_bin     = 0xFFU;
+static uint8_t             g_last_aux8_bin     = 0xFFU;
 
 /* Timing & FHSS lock tracking */
 static volatile uint32_t   g_last_tock_us      = 0U;
@@ -1676,6 +1679,7 @@ static void handle_cli_command(char *line) {
             "  rns_peers [select <idx>]       - List discovered Reticulum peers or select target RX\r\n"
             "  rns_to <dest|sel> <cmd>        - Send command/PING to specific 16B Reticulum RX address\r\n"
             "  crsf_lua <status|peer|ann|pair|ping|loiter|rtl> - Test EdgeTX Lua CRSF 0x7A/0x7B bridge\r\n"
+            "  crsf_ota <status|peer|ann|pair|ping|loiter|rtl> - Tunnel CRSF 0x7A request over the air to RX\r\n"
             "  rns_cmd <GOTO lat lon alt|RTL|LAND|ARM|DISARM|MODE n|RC c1 c2 c3 c4> - Send RNS drone cmd\r\n"
             "  rns_tx <hex_bytes>             - Send raw Reticulum packet over Relay LoRa or ELRS tunnel\r\n"
             "  fc_sim <lat_e7> <lon_e7> <alt_m> <vbatt_mv> - Set simulated FC telemetry for beacons\r\n"
@@ -2113,6 +2117,49 @@ static void handle_cli_command(char *line) {
         return;
     }
 
+    if (strcmp(cmd, "crsf_ota") == 0) {
+        char *sub = strtok(NULL, " ");
+        if (sub == NULL) {
+            hal_usb_uart_puts("ERR: usage: crsf_ota <status|peer [idx]|ann|pair|ping|loiter|rtl>\r\n");
+            return;
+        }
+        uint8_t req[32];
+        size_t req_len = 0U;
+        if (strcasecmp(sub, "status") == 0) {
+            req_len = crsf_build_rns_cmd_frame(CRSF_RNS_SUBCMD_GET_STATUS, NULL, 0U, req);
+        } else if (strcasecmp(sub, "peer") == 0) {
+            char *idx_s = strtok(NULL, " ");
+            uint8_t idx = idx_s ? (uint8_t)strtoul(idx_s, NULL, 10) : 0U;
+            req_len = crsf_build_rns_cmd_frame(CRSF_RNS_SUBCMD_GET_PEER, &idx, 1U, req);
+        } else if (strcasecmp(sub, "pair") == 0) {
+            req_len = crsf_build_rns_cmd_frame(CRSF_RNS_SUBCMD_PAIR_RX, NULL, 0U, req);
+        } else {
+            uint8_t act = 0U;
+            if (strcasecmp(sub, "ann") == 0)         act = CRSF_RNS_ACT_ANNOUNCE;
+            else if (strcasecmp(sub, "ping") == 0)   act = CRSF_RNS_ACT_PING;
+            else if (strcasecmp(sub, "loiter") == 0) act = CRSF_RNS_ACT_LOITER;
+            else if (strcasecmp(sub, "rtl") == 0)    act = CRSF_RNS_ACT_RTL;
+            else if (strcasecmp(sub, "land") == 0)   act = CRSF_RNS_ACT_LAND;
+            else if (strcasecmp(sub, "arm") == 0)    act = CRSF_RNS_ACT_ARM;
+            else if (strcasecmp(sub, "disarm") == 0) act = CRSF_RNS_ACT_DISARM;
+            if (act != 0U) {
+                req_len = crsf_build_rns_cmd_frame(CRSF_RNS_SUBCMD_ACTION, &act, 1U, req);
+            }
+        }
+        if (req_len == 0U) {
+            hal_usb_uart_puts("ERR: crsf_ota invalid subcommand\r\n");
+            return;
+        }
+        /* Address to 0xEC (CRSF_ADDRESS_CRSF_RECEIVER) so it tunnels over the air to the bound RX */
+        req[0] = CRSF_ADDRESS_CRSF_RECEIVER;
+        req[3] = CRSF_ADDRESS_CRSF_RECEIVER;
+        req[req_len - 1U] = crsf_crc8(&req[2], req_len - 3U);
+        bool sent = send_or_tunnel_rns_packet(req, (uint16_t)req_len);
+        hal_usb_uart_printf("OK CRSF_OTA_TX sent=%u len=%u sub=\"%s\"\r\n",
+                            sent ? 1U : 0U, (unsigned)req_len, sub);
+        return;
+    }
+
     if (strcmp(cmd, "rns_cmd") == 0) {
         char *rest = strtok(NULL, "");
         if (rest == NULL) {
@@ -2338,6 +2385,7 @@ int main(void) {
     }
     g_rc_channels[2] = crsf_us_to_ticks(1000U);
     crsf_parser_init(&g_crsf_parser);
+    crsf_parser_init(&g_usb_crsf_parser);
     rnode_kiss_init(&g_kiss_parser, on_rnode_kiss_frame, NULL);
     rns_relay_init(&g_rns_relay);
     rns_peer_table_init(&g_rns_peers);
@@ -2377,7 +2425,7 @@ int main(void) {
     uint32_t last_crsf_linkstats_ms = 0U;
 
     while (1) {
-        /* 1. Process incoming USB CDC CLI or RNode KISS bytes */
+        /* 1. Process incoming USB CDC CLI, RNode KISS, or Plug-and-Play USB-C CRSF bytes */
         int b;
         while ((b = hal_usb_uart_read_byte()) >= 0) {
             uint8_t ub = (uint8_t)b;
@@ -2389,6 +2437,31 @@ int main(void) {
             }
             if (g_app_mode == APP_MODE_RNODE) {
                 rnode_kiss_feed_byte(&g_kiss_parser, ub);
+                continue;
+            }
+            /* Plug-and-play USB-C CRSF auto-detection (0xEA/0xEC/0xEE/0xC8 frames) */
+            if (g_usb_crsf_parser.pos > 0U ||
+                ub == CRSF_SYNC_BYTE || ub == CRSF_ADDRESS_HANDSET ||
+                ub == CRSF_ADDRESS_CRSF_RECEIVER || ub == CRSF_ADDRESS_CRSF_TRANSMITTER) {
+                if (crsf_parser_feed_byte(&g_usb_crsf_parser, ub)) {
+                    uint8_t ftype = g_usb_crsf_parser.buf[2];
+                    uint8_t flen  = (uint8_t)(g_usb_crsf_parser.expected_len + 2U);
+                    cli_pos = 0U;
+                    if (ftype == CRSF_FRAMETYPE_RC_CHANNELS) {
+                        (void)crsf_decode_rc_channels_frame(g_usb_crsf_parser.buf, flen, g_rc_channels);
+                        g_rc_is_armed = (g_rc_channels[4] > ELRS_CRSF_CH_MID);
+                    } else if (ftype == CRSF_FRAMETYPE_DEVICE_PING || ftype == CRSF_FRAMETYPE_RNS_CMD) {
+                        if (g_app_mode == APP_MODE_ELRS_TX && g_usb_crsf_parser.buf[3] == CRSF_ADDRESS_CRSF_RECEIVER) {
+                            (void)send_or_tunnel_rns_packet(g_usb_crsf_parser.buf, flen);
+                        } else {
+                            uint8_t resp[64];
+                            size_t rlen = process_crsf_rns_frame(g_usb_crsf_parser.buf, flen, resp);
+                            if (rlen > 0U) {
+                                hal_usb_uart_write(resp, rlen);
+                            }
+                        }
+                    }
+                }
                 continue;
             }
             char c = (char)b;
@@ -2413,10 +2486,15 @@ int main(void) {
                     (void)crsf_decode_rc_channels_frame(g_crsf_parser.buf, flen, g_rc_channels);
                     g_rc_is_armed = (g_rc_channels[4] > ELRS_CRSF_CH_MID);
                 } else if (ftype == CRSF_FRAMETYPE_DEVICE_PING || ftype == CRSF_FRAMETYPE_RNS_CMD) {
-                    uint8_t resp[64];
-                    size_t rlen = process_crsf_rns_frame(g_crsf_parser.buf, flen, resp);
-                    if (rlen > 0U) {
-                        hal_crsf_uart_write(resp, rlen);
+                    if (g_app_mode == APP_MODE_ELRS_TX && g_crsf_parser.buf[3] == CRSF_ADDRESS_CRSF_RECEIVER) {
+                        /* Forward handset CRSF request addressed to 0xEC over the air to the bound RX */
+                        (void)send_or_tunnel_rns_packet(g_crsf_parser.buf, flen);
+                    } else {
+                        uint8_t resp[64];
+                        size_t rlen = process_crsf_rns_frame(g_crsf_parser.buf, flen, resp);
+                        if (rlen > 0U) {
+                            hal_crsf_uart_write(resp, rlen);
+                        }
                     }
                 }
             }
@@ -2511,23 +2589,70 @@ int main(void) {
                                 (g_relay_tx_len > 1U) ? g_relay_tx_buf[1] : 0U);
         }
 
-        /* 4. Handle reassembled Reticulum packet from ExpressLRS DATA tunnel */
+        /* 4. Handle reassembled Reticulum packet or Over-the-Air CRSF frame from ExpressLRS DATA tunnel */
         if (g_tunnel_rx_ready) {
             uint8_t tun_pkt[ELRS_TUNNEL_MAX_MTU];
             uint16_t tun_len = g_tunnel_rx_len;
             memcpy(tun_pkt, g_tunnel_rx_buf, tun_len);
             g_tunnel_rx_ready = false;
 
-            hal_usb_uart_printf("ELRS_RNS_RX len=%u hops=%u hex=",
-                                tun_len, (tun_len > 1U) ? tun_pkt[1] : 0U);
-            uint16_t dump_max = (tun_len < 32U) ? tun_len : 32U;
-            for (uint16_t i = 0U; i < dump_max; i++) {
-                hal_usb_uart_printf("%02X", tun_pkt[i]);
+            /* Check if the tunneled message is a CRSF frame (0x28/0x29/0x21/0x7A/0x7B) */
+            bool is_crsf = false;
+            if (tun_len >= 4U && tun_len <= CRSF_MAX_FRAME_LEN &&
+                (tun_pkt[0] == CRSF_SYNC_BYTE || tun_pkt[0] == CRSF_ADDRESS_HANDSET ||
+                 tun_pkt[0] == CRSF_ADDRESS_CRSF_RECEIVER || tun_pkt[0] == CRSF_ADDRESS_CRSF_TRANSMITTER) &&
+                (uint16_t)(tun_pkt[1] + 2U) == tun_len &&
+                crsf_crc8(&tun_pkt[2], (size_t)(tun_pkt[1] - 1U)) == tun_pkt[tun_len - 1U]) {
+                uint8_t ftype = tun_pkt[2];
+                if (ftype == CRSF_FRAMETYPE_DEVICE_PING || ftype == CRSF_FRAMETYPE_RNS_CMD) {
+                    is_crsf = true;
+                    uint8_t resp[64];
+                    size_t rlen = process_crsf_rns_frame(tun_pkt, (uint8_t)tun_len, resp);
+                    if (rlen > 0U) {
+                        bool sent = send_or_tunnel_rns_packet(resp, (uint16_t)rlen);
+                        hal_usb_uart_printf("OTA_CRSF_REQ_RX ftype=0x%02X sub=0x%02X resp_len=%u sent=%u\r\n",
+                                            ftype, (tun_len >= 6U) ? tun_pkt[5] : 0U,
+                                            (unsigned)rlen, sent ? 1U : 0U);
+                    }
+                } else if (ftype == CRSF_FRAMETYPE_DEVICE_INFO ||
+                           ftype == CRSF_FRAMETYPE_RNS_TLM ||
+                           ftype == CRSF_FRAMETYPE_FLIGHT_MODE) {
+                    is_crsf = true;
+                    hal_crsf_uart_write(tun_pkt, tun_len);
+                    if (ftype == CRSF_FRAMETYPE_RNS_TLM && tun_len >= 6U && tun_pkt[5] == CRSF_RNS_RESP_STATUS) {
+                        crsf_rns_status_t st;
+                        if (crsf_decode_rns_status_frame(tun_pkt, tun_len, &st)) {
+                            char rxh[33];
+                            format_hex_bytes(st.tx_dest, 16U, rxh);
+                            hal_usb_uart_printf("OTA_CRSF_STATUS_RX mode=%u lock=%u freq=%lu bw_khz=%u sf=%u cr=4/%u peers=%u rtt=%ums rx_dest=%s\r\n",
+                                                st.app_mode, st.lock_state,
+                                                (unsigned long)st.rnode_freq_hz, (unsigned)st.rnode_bw_khz,
+                                                st.rnode_sf, st.rnode_cr, st.peer_count, st.last_ping_rtt_ms, rxh);
+                        }
+                    } else if (ftype == CRSF_FRAMETYPE_RNS_TLM && tun_len >= 6U && tun_pkt[5] == CRSF_RNS_RESP_ACK) {
+                        hal_usb_uart_printf("OTA_CRSF_ACK_RX subcmd=0x%02X status=%u\r\n",
+                                            tun_pkt[6], tun_pkt[7]);
+                    } else if (ftype == CRSF_FRAMETYPE_FLIGHT_MODE) {
+                        char fm_str[32];
+                        if (crsf_decode_flight_mode_frame(tun_pkt, tun_len, fm_str, sizeof(fm_str))) {
+                            hal_usb_uart_printf("OTA_CRSF_FM_RX fm=\"%s\"\r\n", fm_str);
+                        }
+                    }
+                }
             }
-            if (tun_len > dump_max) hal_usb_uart_puts("...");
-            hal_usb_uart_puts("\r\n");
 
-            inspect_and_act_on_rns_packet(tun_pkt, tun_len, "ELRS_TUNNEL");
+            if (!is_crsf) {
+                hal_usb_uart_printf("ELRS_RNS_RX len=%u hops=%u hex=",
+                                    tun_len, (tun_len > 1U) ? tun_pkt[1] : 0U);
+                uint16_t dump_max = (tun_len < 32U) ? tun_len : 32U;
+                for (uint16_t i = 0U; i < dump_max; i++) {
+                    hal_usb_uart_printf("%02X", tun_pkt[i]);
+                }
+                if (tun_len > dump_max) hal_usb_uart_puts("...");
+                hal_usb_uart_puts("\r\n");
+
+                inspect_and_act_on_rns_packet(tun_pkt, tun_len, "ELRS_TUNNEL");
+            }
         }
 
         /* 5. Periodic Reticulum Telemetry Beacon (rnlog.beacon) */
@@ -2538,12 +2663,33 @@ int main(void) {
             (void)send_or_tunnel_rns_packet(pkt, (uint16_t)blen);
         }
 
-        /* 6. In Active RX mode, forward CRSF RC channels & periodic LINK_STATISTICS (0x14) to FC */
+        /* 6. In Active RX mode, forward CRSF RC channels, wire-free AUX switch triggers & LINK_STATISTICS (0x14) */
         if (g_app_mode == APP_MODE_ELRS_RX && g_crsf_rc_pending) {
             g_crsf_rc_pending = false;
             uint8_t crsf_frame[26];
             crsf_build_rc_channels_frame(g_rc_channels, crsf_frame);
             hal_crsf_uart_write(crsf_frame, sizeof(crsf_frame));
+
+            /* Wire-free RC AUX7 (ch11, idx 10) / AUX8 (ch12, idx 11) switch command triggers:
+             * Allows a stock handset with internal ELRS TX to trigger Reticulum Announce or
+             * Flight Mode (RNS:dest) telemetry broadcast with zero external wiring. */
+            uint8_t aux7_bin = (g_rc_channels[10] < 600U) ? 0U : ((g_rc_channels[10] > 1400U) ? 2U : 1U);
+            if (g_last_aux7_bin != 0xFFU && aux7_bin != g_last_aux7_bin && aux7_bin == 2U) {
+                (void)send_rns_node_announce();
+                char fm_buf[28];
+                snprintf(fm_buf, sizeof(fm_buf), "RNS:%02x%02x..%02x%02x %up",
+                         g_rns_id.dest_hash[0], g_rns_id.dest_hash[1],
+                         g_rns_id.dest_hash[14], g_rns_id.dest_hash[15],
+                         (unsigned)g_rns_peers.count);
+                uint8_t fm_frame[36];
+                size_t fm_len = crsf_build_flight_mode_frame(fm_buf, fm_frame);
+                if (fm_len > 0U) {
+                    hal_crsf_uart_write(fm_frame, fm_len);
+                }
+                hal_usb_uart_printf("RC_AUX_TRIGGER ch11=HIGH action=ANNOUNCE fm=\"%s\"\r\n", fm_buf);
+            }
+            g_last_aux7_bin = aux7_bin;
+            (void)g_last_aux8_bin;
         }
         if (g_app_mode == APP_MODE_ELRS_RX && g_lock_state == LOCK_CONNECTED &&
             (now_ms - last_crsf_linkstats_ms) >= 100U) {

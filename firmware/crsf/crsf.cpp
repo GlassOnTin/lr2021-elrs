@@ -126,7 +126,8 @@ void crsf_parser_init(crsf_parser_t *parser) {
 
 bool crsf_parser_feed_byte(crsf_parser_t *parser, uint8_t byte) {
     if (parser->pos == 0U) {
-        if (byte == CRSF_SYNC_BYTE || byte == CRSF_ADDRESS_HANDSET || byte == CRSF_ADDRESS_CRSF_TRANSMITTER) {
+        if (byte == CRSF_SYNC_BYTE || byte == CRSF_ADDRESS_HANDSET ||
+            byte == CRSF_ADDRESS_CRSF_RECEIVER || byte == CRSF_ADDRESS_CRSF_TRANSMITTER) {
             parser->buf[0] = byte;
             parser->pos = 1U;
         }
@@ -200,6 +201,36 @@ size_t crsf_build_device_info_frame(const char *device_name, uint32_t serial_no,
     out_frame[1] = (uint8_t)(idx - 1U); /* type..payload + crc */
     out_frame[idx] = crsf_crc8(&out_frame[2], idx - 2U);
     return idx + 1U;
+}
+
+size_t crsf_build_flight_mode_frame(const char *fm_str, uint8_t out_frame[CRSF_MAX_FRAME_LEN]) {
+    if (fm_str == NULL || out_frame == NULL) return 0U;
+    size_t slen = strlen(fm_str);
+    if (slen > 28U) slen = 28U;
+
+    out_frame[0] = CRSF_SYNC_BYTE;
+    out_frame[1] = (uint8_t)(slen + 3U); /* type(1) + string(slen) + NUL(1) + crc(1) */
+    out_frame[2] = CRSF_FRAMETYPE_FLIGHT_MODE;
+    memcpy(&out_frame[3], fm_str, slen);
+    out_frame[3U + slen] = '\0';
+    out_frame[4U + slen] = crsf_crc8(&out_frame[2], slen + 2U);
+    return slen + 5U;
+}
+
+bool crsf_decode_flight_mode_frame(const uint8_t *frame, size_t frame_len, char *out_str, size_t max_len) {
+    if (frame == NULL || out_str == NULL || max_len == 0U || frame_len < 5U) return false;
+    uint8_t flen = frame[1];
+    if ((size_t)(flen + 2U) > frame_len || frame[2] != CRSF_FRAMETYPE_FLIGHT_MODE) {
+        return false;
+    }
+    if (crsf_crc8(&frame[2], (size_t)(flen - 1U)) != frame[flen + 1U]) {
+        return false;
+    }
+    size_t pay_len = (size_t)(flen - 2U);
+    size_t copy_len = (pay_len < (max_len - 1U)) ? pay_len : (max_len - 1U);
+    memcpy(out_str, &frame[3], copy_len);
+    out_str[copy_len] = '\0';
+    return true;
 }
 
 size_t crsf_build_rns_status_frame(const crsf_rns_status_t *st, uint8_t out_frame[CRSF_MAX_FRAME_LEN]) {

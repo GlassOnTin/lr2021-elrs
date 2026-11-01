@@ -140,9 +140,14 @@ Send Reticulum drone commands (`GOTO`, `RTL`, `LOITER`, `LAND`, `MODE`, `ARM`, `
 ./tools/lr2021_cli.py -p /dev/ttyACM5 rns-to sel LOITER
 ```
 
-### 2b. EdgeTX / OpenTX Handset Lua Script (`tools/rns_elrs.lua`)
+### 2b. Wire-Free EdgeTX / OpenTX Handset Integration (`tools/rns_elrs.lua`, Over-the-Air CRSF & USB-C)
+No GPIO jumper wires to the handset are required. You can control and pair Reticulum nodes in three wire-free ways:
+1. **Over-the-Air CRSF (`0xEC` Receiver Target):** Using a handset's built-in internal ExpressLRS transmitter (such as the RadioMaster TX16S MK3) or an LR2021 TX module, [`tools/rns_elrs.lua`](tools/rns_elrs.lua) can toggle `[OTA-RX(0xEC)]` on Page 1 to tunnel `0x7A` CRSF requests **over the air** to the bound LR2021 receiver (`ELRS_RX`) and receive `0x7B` status/peer telemetry frames back over the air (`crsf_ota <status|peer|ann|pair|ping|loiter|rtl>`).
+2. **Wire-Free RC Switch Trigger (`CH11` / `AUX7`):** Flipping `CH11` (`AUX7`) HIGH on any bound ExpressLRS handset triggers the LR2021 receiver to broadcast a signed 68-byte Reticulum `RNSA` node announce and emit a standard CRSF `0x21` `FLIGHT_MODE` telemetry string (`RNS:4cef..c149 1p`) directly to the handset's native telemetry screen.
+3. **Single-Cable Plug-and-Play USB-C CRSF:** The USB-C port (`UARTE22`) auto-detects binary CRSF (`0xEA`/`0xEC`/`0xEE`/`0xC8`) alongside RNode KISS (`0xC0`) and the ASCII CLI, so a ground companion node needs only a USB-C cable.
+
 Copy [`tools/rns_elrs.lua`](tools/rns_elrs.lua) to `/SCRIPTS/TOOLS/rns_elrs.lua` on your EdgeTX handset SD card (supports both `480x272` ColorLCD radios like the RadioMaster TX16S MK3 and `128x64` B&W radios like Boxer/Pocket/Zorro) and launch **RNS-ELRS Mesh** from `SYS -> Tools`:
-- **Page 1 (Identity & Pairing):** Displays the TX module's 16-byte Reticulum `SINGLE` address (`tx_dest`), the bound/selected receiver's 16-byte Reticulum address (`rx_dest`), link lock, peer count, and ping RTT (`ms`). Trigger `[Pair & Sync RX]` (`RNSP`) or `[Announce TX]` (`RNSA`) with one click.
+- **Page 1 (Identity & Pairing):** Displays the TX module's 16-byte Reticulum `SINGLE` address (`tx_dest`), the bound/selected receiver's 16-byte Reticulum address (`rx_dest`), link lock, peer count, and ping RTT (`ms`). Trigger `[Pair & Sync RX]` (`RNSP`), `[Announce]` (`RNSA`), or toggle `[TX-MOD(0xEE)]` / `[OTA-RX(0xEC)]`.
 - **Page 2 (RNode LoRa Config):** Configure Reticulum LoRa frequency (`868.000`, `869.525`, `915.000`, `2440.000 MHz`), bandwidth (`125..812.5 kHz`), spreading factor (`SF5..SF12`), coding rate (`4/5..4/8`), TX power, and IFAC, then click `[Apply & Push OTA to RX]`.
 - **Page 3 (Mesh Peers):** Browse up to 8 discovered Reticulum mesh peers (receivers, airborne relays, RNodes) with hop count, RSSI, SNR, and battery voltage; press `ENTER` on any peer to select it as the active target receiver.
 - **Page 4 (Targeted RX Cmd):** Send `[Ping RX]`, `[LOITER]`, `[RTL]`, `[LAND]`, `[ARM]`, or `[DISARM]` addressed directly to the selected receiver's 16-byte Reticulum destination hash (`RNSC`).
@@ -250,6 +255,8 @@ Tested on two `LR2021EVK1XBS1_XIAO` boards (`FC6D1A37` and `D56B6941`), a live *
    [TX] RNS_PEER_ANNOUNCE src=ELRS_TUNNEL idx=0 dest=4cef6984feb38c2429a1efa42b89c149 role=2 hops=0 name="LR2021-RX" vbatt=25200mV mode=0
    [TX] RNS_CMD_ACK_RX src=ELRS_TUNNEL from=4cef6984feb38c2429a1efa42b89c149 hops=0 seq=2 rtt_ms=636 ack="ACK:LOITER"
    [TX] OK CRSF_LUA_STATUS len=62 mode=2 lock=2 freq=869525000 bw_khz=250 sf=8 cr=4/6 peers=1 rtt=636ms tx_dest=b535904babf85e6d9ef1ab15ec1061f9 rx_dest=4cef6984feb38c2429a1efa42b89c149
+   [TX -> RX OTA CRSF] OTA_CRSF_STATUS_RX mode=3 lock=2 freq=868000000 bw_khz=125 sf=7 cr=4/5 peers=0 rtt=0ms rx_dest=4cef6984feb38c2429a1efa42b89c149
+   [RX AUX7 Trigger] RC_AUX_TRIGGER ch11=HIGH action=ANNOUNCE fm="RNS:4cef..c149 0p"
    ```
 
 ### Limitations
