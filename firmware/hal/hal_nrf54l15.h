@@ -57,6 +57,7 @@ void hal_radio_irq_enable(bool enable);
 /* ExpressLRS Hardware Timer (TIMER20 @ 1 MHz) with tick/tock half-periods and phaseShift */
 void hal_hwtimer_init(uint32_t interval_us, hal_timer_cb_t tick_cb, hal_timer_cb_t tock_cb);
 void hal_hwtimer_start(void);
+void hal_hwtimer_anchor_tock_in_us(uint32_t delay_us);
 void hal_hwtimer_stop(void);
 void hal_hwtimer_update_interval(uint32_t interval_us);
 void hal_hwtimer_phase_shift(int32_t shift_us);

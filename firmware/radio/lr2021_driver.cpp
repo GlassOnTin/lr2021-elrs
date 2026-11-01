@@ -36,22 +36,22 @@ static const uint8_t k_hamming_enc[16] = {
 };
 
 static const uint8_t k_hamming_dec[128] = {
-    0x00, 0x01, 0x02, 0x03, 0x04, 0x0D, 0x06, 0x03,
-    0x08, 0x0A, 0x0A, 0x0A, 0x0F, 0x0D, 0x0E, 0x03,
-    0x00, 0x01, 0x07, 0x01, 0x04, 0x05, 0x04, 0x07,
-    0x08, 0x09, 0x0B, 0x0B, 0x0C, 0x09, 0x0E, 0x07,
-    0x00, 0x05, 0x02, 0x02, 0x06, 0x05, 0x06, 0x06,
-    0x08, 0x09, 0x0A, 0x02, 0x0C, 0x0C, 0x06, 0x0F,
-    0x08, 0x01, 0x02, 0x0B, 0x04, 0x05, 0x06, 0x07,
-    0x08, 0x08, 0x08, 0x0B, 0x08, 0x0D, 0x0E, 0x0F,
-    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x03, 0x03,
-    0x09, 0x09, 0x0A, 0x03, 0x0C, 0x0D, 0x0E, 0x03,
-    0x04, 0x01, 0x0A, 0x01, 0x04, 0x04, 0x04, 0x07,
-    0x0E, 0x09, 0x0A, 0x0B, 0x04, 0x0D, 0x0E, 0x0E,
-    0x02, 0x0C, 0x02, 0x02, 0x0D, 0x05, 0x06, 0x07,
+    0x00, 0x00, 0x00, 0x03, 0x00, 0x05, 0x0E, 0x07,
+    0x00, 0x09, 0x0E, 0x0B, 0x0E, 0x0D, 0x0E, 0x0E,
+    0x00, 0x03, 0x03, 0x03, 0x04, 0x0D, 0x06, 0x03,
+    0x08, 0x0D, 0x0A, 0x03, 0x0D, 0x0D, 0x0E, 0x0D,
+    0x00, 0x05, 0x02, 0x0B, 0x05, 0x05, 0x06, 0x05,
+    0x08, 0x0B, 0x0B, 0x0B, 0x0C, 0x05, 0x0E, 0x0B,
+    0x08, 0x01, 0x06, 0x03, 0x06, 0x05, 0x06, 0x06,
+    0x08, 0x08, 0x08, 0x0B, 0x08, 0x0D, 0x06, 0x0F,
+    0x00, 0x09, 0x02, 0x07, 0x04, 0x07, 0x07, 0x07,
+    0x09, 0x09, 0x0A, 0x09, 0x0C, 0x09, 0x0E, 0x07,
+    0x04, 0x01, 0x0A, 0x03, 0x04, 0x04, 0x04, 0x07,
+    0x0A, 0x09, 0x0A, 0x0A, 0x04, 0x0D, 0x0A, 0x0F,
+    0x02, 0x01, 0x02, 0x02, 0x0C, 0x05, 0x02, 0x07,
     0x0C, 0x09, 0x02, 0x0B, 0x0C, 0x0C, 0x0C, 0x0F,
-    0x01, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-    0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F
+    0x01, 0x01, 0x02, 0x01, 0x04, 0x01, 0x06, 0x0F,
+    0x08, 0x01, 0x0A, 0x0F, 0x0C, 0x0F, 0x0F, 0x0F
 };
 
 static void fec_encode_8_to_14(const uint8_t *in8, uint8_t *out14) {
@@ -329,16 +329,12 @@ void lr2021_set_mode(lr20xx_RadioOperatingModes_t mode) {
         case LR2021_MODE_FS:
             (void)lr2021_write_cmd(LR2021_SYSTEM_SET_FS_OC, NULL, 0U, 10000U);
             break;
-        case LR2021_MODE_RX_CONT: {
-            const uint8_t rx_timeout[3] = {0xFFU, 0xFFU, 0xFFU};
-            (void)lr2021_write_cmd(LR2021_RADIO_SET_RX_OC, rx_timeout, sizeof(rx_timeout), 10000U);
+        case LR2021_MODE_RX_CONT:
+            (void)lr2021_write_cmd(LR2021_RADIO_SET_RX_OC, NULL, 0U, 10000U);
             break;
-        }
-        case LR2021_MODE_TX: {
-            const uint8_t tx_timeout[3] = {0x00U, 0x00U, 0x00U};
-            (void)lr2021_write_cmd(LR2021_RADIO_SET_TX_OC, tx_timeout, sizeof(tx_timeout), 10000U);
+        case LR2021_MODE_TX:
+            (void)lr2021_write_cmd(LR2021_RADIO_SET_TX_OC, NULL, 0U, 10000U);
             break;
-        }
         default:
             break;
     }
@@ -424,8 +420,12 @@ void lr2021_config_lora(uint8_t bw,
     };
     (void)lr2021_write_cmd(LR2021_RADIO_SET_LORA_MODULATION_PARAM_OC, mod_params, sizeof(mod_params), 10000U);
 
-    if (g_is_sub_ghz && sf == LR2021_RADIO_LORA_SF6 && !explicit_header) {
-        /* SX1276 implicit-header SF6 compatibility register workaround */
+    /* SX1276 implicit-header SF6 compatibility register (0x00F30A14 bits [19:18]):
+     * Must be 0b10 (0x08) for Sub-GHz SF6 implicit header, and 0b00 (0x00) for all
+     * 2.4 GHz LoRa and non-SF6 modes so 2.4 GHz SF6 (e.g. 2G4_250HZ) demodulates properly.
+     */
+    {
+        uint8_t compat_byte = (g_is_sub_ghz && sf == LR2021_RADIO_LORA_SF6 && !explicit_header) ? 0x08U : 0x00U;
         const uint8_t wrbuf[11] = {
             (uint8_t)(LR20XX_WORKAROUND_LORA_SX1276_COMPATIBILITY_REGISTER_ADDRESS >> 16U),
             (uint8_t)(LR20XX_WORKAROUND_LORA_SX1276_COMPATIBILITY_REGISTER_ADDRESS >> 8U),
@@ -434,7 +434,7 @@ void lr2021_config_lora(uint8_t bw,
             (uint8_t)(LR20XX_WORKAROUND_LORA_SX1276_COMPATIBILITY_REGISTER_MASK >> 16U),
             (uint8_t)(LR20XX_WORKAROUND_LORA_SX1276_COMPATIBILITY_REGISTER_MASK >> 8U),
             (uint8_t)(LR20XX_WORKAROUND_LORA_SX1276_COMPATIBILITY_REGISTER_MASK & 0xFFU),
-            0x00U, 0x08U, 0x00U, 0x00U
+            0x00U, compat_byte, 0x00U, 0x00U
         };
         (void)lr2021_write_cmd(LR2021_REGMEM_WRITE_REGMEM32_MASK_OC, wrbuf, sizeof(wrbuf), 10000U);
     }
@@ -641,6 +641,7 @@ void lr2021_tx_nb(const uint8_t *data, uint8_t len) {
         memcpy(out_buf, data, wire_len);
     }
 
+    lr2021_set_mode(LR2021_MODE_FS);
     (void)lr2021_write_cmd(LR2021_RADIO_WRITE_TX_FIFO, out_buf, wire_len, 5000U);
     lr2021_set_mode(LR2021_MODE_TX);
 }
@@ -653,8 +654,7 @@ int8_t lr2021_get_rssi_inst_dbm(void) {
     uint8_t status[4] = {0};
     (void)lr2021_write_cmd(LR2021_RADIO_GET_RSSI_INST_OC, NULL, 0U, 5000U);
     (void)lr2021_read_response(status, sizeof(status), 5000U);
-    uint8_t half_dbm = status[2];
-    return -(int8_t)(half_dbm >> 1U);
+    return -(int8_t)status[2];
 }
 
 void lr2021_set_callbacks(lr2021_rx_done_cb_t rx_cb, lr2021_tx_done_cb_t tx_cb) {
@@ -685,17 +685,17 @@ void lr2021_decode_last_pkt_stats(lr2021_pkt_stats_t *out_stats) {
     if (g_mod_type == LR2021_MOD_FSK) {
         (void)lr2021_write_cmd(LR2021_RADIO_GET_FSK_PACKET_STATUS_OC, NULL, 0U, 5000U);
         (void)lr2021_read_response(buf, 8U, 5000U);
-        out_stats->rssi_dbm  = -(int8_t)(buf[4] >> 1U);
+        out_stats->rssi_dbm  = -(int8_t)buf[4];
         out_stats->snr_q2_db = 0;
     } else if (g_mod_type == LR2021_MOD_FLRC) {
         (void)lr2021_write_cmd(LR2021_RADIO_GET_FLRC_PACKET_STATUS_OC, NULL, 0U, 5000U);
         (void)lr2021_read_response(buf, 7U, 5000U);
-        out_stats->rssi_dbm  = -(int8_t)(buf[4] >> 1U);
+        out_stats->rssi_dbm  = -(int8_t)buf[4];
         out_stats->snr_q2_db = 0;
     } else {
         (void)lr2021_write_cmd(LR2021_RADIO_GET_LORA_PACKET_STATUS_OC, NULL, 0U, 5000U);
         (void)lr2021_read_response(buf, 8U, 5000U);
-        out_stats->rssi_dbm  = -(int8_t)(buf[5] >> 1U);
+        out_stats->rssi_dbm  = -(int8_t)buf[6];
         out_stats->snr_q2_db = (int8_t)buf[4];
     }
     memcpy(out_stats->status_raw, buf, sizeof(buf));
@@ -723,4 +723,10 @@ uint32_t lr2021_get_rx_done_count(void) {
 
 uint32_t lr2021_get_tx_done_count(void) {
     return g_tx_done_count;
+}
+
+void lr2021_reset_counters(void) {
+    g_irq_count     = 0U;
+    g_rx_done_count = 0U;
+    g_tx_done_count = 0U;
 }

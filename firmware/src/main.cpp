@@ -31,7 +31,9 @@ typedef enum {
 
 static app_mode_t          g_app_mode          = APP_MODE_IDLE;
 static lock_state_t        g_lock_state        = LOCK_DISCONNECTED;
-static elrs_domain_t       g_domain            = ELRS_DOMAIN_FCC915;
+static elrs_domain_t       g_domain            = ELRS_DOMAIN_EU868;
+static elrs_domain_t       g_subghz_domain     = ELRS_DOMAIN_EU868;
+static elrs_domain_t       g_2g4_domain        = ELRS_DOMAIN_CE2G4;
 static uint8_t             g_rate_idx          = 3U; /* Default: 900_200HZ (LoRa SF6 BW500) */
 static int8_t              g_tx_power_dbm      = 10; /* Safe +10 dBm (10 mW) bench default */
 static bool                g_monitor_verbose   = true;
@@ -42,6 +44,7 @@ static elrs_fhss_state_t   g_fhss;
 /* RC channel state (16 channels in 11-bit CRSF ticks 172..1811, center 992 = 1500 us) */
 static uint16_t            g_rc_channels[ELRS_NUM_CHANNELS];
 static bool                g_rc_is_armed       = false;
+static volatile bool       g_crsf_rc_pending   = false;
 static crsf_parser_t       g_crsf_parser;
 
 /* Timing & FHSS lock tracking */
@@ -53,6 +56,12 @@ static volatile bool       g_got_pkt_this_slot = false;
 static volatile int32_t    g_last_phase_err_us = 0;
 static volatile uint8_t    g_tlm_denom         = 64U;
 static volatile uint16_t   g_rf_Consec_good    = 0U;
+static volatile uint8_t    g_tentative_slots   = 0U;
+static volatile uint8_t    g_tentative_hops    = 0U;
+static volatile bool       g_tentative_from_pair = false;
+static uint16_t            g_chip_version      = 0x0118U;
+static uint32_t            g_prev_sync_ch_us   = 0U;
+static uint8_t             g_prev_sync_ch_pkt[ELRS_OTA8_PACKET_SIZE];
 
 /* Diagnostic & Link Statistics */
 static volatile uint32_t   g_crc_ok_count      = 0U;
@@ -144,9 +153,9 @@ static void configure_radio_for_current_rate(void) {
                         rate->phy_type == ELRS_PHY_FLRC_2G4 ||
                         rate->phy_type == ELRS_PHY_FSK_2G4);
     if (rate_is_2g4 && g_domain != ELRS_DOMAIN_ISM2G4 && g_domain != ELRS_DOMAIN_CE2G4) {
-        g_domain = ELRS_DOMAIN_ISM2G4;
+        g_domain = g_2g4_domain;
     } else if (!rate_is_2g4 && (g_domain == ELRS_DOMAIN_ISM2G4 || g_domain == ELRS_DOMAIN_CE2G4)) {
-        g_domain = ELRS_DOMAIN_FCC915;
+        g_domain = g_subghz_domain;
     }
 
     elrs_ota_set_mode(&g_ota, rate->payload_len, g_ota.switch_mode);
@@ -178,7 +187,7 @@ static void configure_radio_for_current_rate(void) {
     } else {
         uint32_t bitrate = (uint32_t)rate->bw * 10000UL;
         uint32_t fdev    = (uint32_t)rate->cr * 1000UL;
-        bool use_fec     = (rate->phy_type == ELRS_PHY_FSK_2G4);
+        bool use_fec     = (rate->payload_len == ELRS_OTA4_PACKET_SIZE);
         lr2021_config_fsk(bitrate,
                           rate->sf,
                           fdev,
@@ -231,12 +240,19 @@ static void elrs_hwtimer_tock_cb(void) {
         uint32_t sync_interval_ms = (g_tlm_rx_count > 0U) ? 1000U : 200U;
 
         if (on_sync_ch && (now_ms - g_last_sync_tx_ms) >= sync_interval_ms) {
+            uint8_t tlm_ratio_field = 0U;
+            for (uint8_t r = 1U; r <= 7U; r++) {
+                if ((uint8_t)(1U << (8U - r)) == g_tlm_denom) {
+                    tlm_ratio_field = r;
+                    break;
+                }
+            }
             elrs_sync_data_t sync = {
                 .fhss_index      = (uint8_t)g_fhss.hop_ptr,
                 .nonce           = g_ota.ota_nonce,
                 .rf_rate_enum    = (uint8_t)rate->rate_enum,
                 .switch_enc_mode = (uint8_t)g_ota.switch_mode,
-                .new_tlm_ratio   = 0U, /* TLM_RATIO_STD */
+                .new_tlm_ratio   = tlm_ratio_field,
                 .gemini_mode     = 0U,
                 .ota_protocol    = 0U,
                 .uid4            = g_ota.uid[4],
@@ -258,12 +274,23 @@ static void elrs_hwtimer_tock_cb(void) {
             return;
         }
 
-        /* Check lock timeout */
+        /* Check lock timeout: in LOCK_TENTATIVE, require lock within 12 slots (12 ms) */
         uint32_t now_ms = hal_millis();
-        uint32_t timeout_ms = (g_lock_state == LOCK_TENTATIVE) ? 1500U : 3000U;
-        if ((now_ms - g_last_valid_pkt_ms) > timeout_ms) {
-            g_lock_state    = LOCK_DISCONNECTED;
-            g_rf_Consec_good = 0U;
+        bool drop_lock = false;
+        if (g_lock_state == LOCK_TENTATIVE) {
+            g_tentative_slots++;
+            if (g_tentative_slots > 12U) {
+                drop_lock = true;
+            }
+        } else if ((now_ms - g_last_valid_pkt_ms) > 3000U) {
+            drop_lock = true;
+        }
+        if (drop_lock) {
+            g_lock_state          = LOCK_DISCONNECTED;
+            g_rf_Consec_good      = 0U;
+            g_tentative_slots     = 0U;
+            g_tentative_hops      = 0U;
+            g_tentative_from_pair = false;
             elrs_fhss_set_index(&g_fhss, 0U);
             uint32_t sync_freq = elrs_fhss_get_initial_freq(&g_fhss);
             lr2021_set_frequency(sync_freq, true);
@@ -275,8 +302,30 @@ static void elrs_hwtimer_tock_cb(void) {
         g_ota.ota_nonce++;
         g_got_pkt_this_slot = false;
         uint32_t freq = elrs_fhss_get_curr_freq(&g_fhss);
-        if ((g_ota.ota_nonce % rate->fhss_hop_interval) == 0U) {
-            freq = elrs_fhss_advance_and_get_freq(&g_fhss);
+        bool did_hop = ((g_ota.ota_nonce % rate->fhss_hop_interval) == 0U);
+        if (did_hop) {
+            g_tentative_hops++;
+            if (g_lock_state == LOCK_TENTATIVE && g_tentative_from_pair && g_rf_Consec_good == 1U) {
+                /* Step through each sync_channel sub-sequence (0, 80, 160) on consecutive hops */
+                uint8_t num_sync = (uint8_t)(g_fhss.sequence_count / g_fhss.info->freq_count);
+                uint8_t cand = (uint8_t)(g_tentative_hops - 1U);
+                if (cand < num_sync) {
+                    uint8_t try_idx = (uint8_t)(cand * g_fhss.info->freq_count + g_tentative_hops);
+                    elrs_fhss_set_index(&g_fhss, try_idx);
+                    freq = elrs_fhss_get_curr_freq(&g_fhss);
+                } else {
+                    g_lock_state          = LOCK_DISCONNECTED;
+                    g_rf_Consec_good      = 0U;
+                    g_tentative_slots     = 0U;
+                    g_tentative_hops      = 0U;
+                    g_tentative_from_pair = false;
+                    elrs_fhss_set_index(&g_fhss, 0U);
+                    lr2021_set_frequency(elrs_fhss_get_initial_freq(&g_fhss), true);
+                    return;
+                }
+            } else {
+                freq = elrs_fhss_advance_and_get_freq(&g_fhss);
+            }
             g_fhss_hop_count++;
         }
 
@@ -284,7 +333,9 @@ static void elrs_hwtimer_tock_cb(void) {
         if (g_app_mode == APP_MODE_ELRS_RX &&
             g_lock_state == LOCK_CONNECTED &&
             is_telemetry_slot(g_ota.ota_nonce, g_tlm_denom)) {
-            lr2021_set_frequency(freq, false);
+            if (did_hop) {
+                lr2021_set_frequency(freq, false);
+            }
             uint8_t rssi_mag = (g_last_rssi_dbm < 0) ? (uint8_t)(-g_last_rssi_dbm) : 0U;
             elrs_link_stats_data_t ls = {
                 .uplink_rssi_1  = rssi_mag,
@@ -298,7 +349,7 @@ static void elrs_hwtimer_tock_cb(void) {
             uint8_t pkt[ELRS_OTA8_PACKET_SIZE];
             elrs_ota_pack_linkstats(&g_ota, &ls, 0U, false, pkt);
             lr2021_tx_nb(pkt, rate->payload_len);
-        } else {
+        } else if (did_hop) {
             lr2021_set_frequency(freq, true);
         }
     }
@@ -370,20 +421,28 @@ static void radio_rx_done_isr(const uint8_t *payload, uint8_t len, const lr2021_
         elrs_sync_data_t sync;
         if (elrs_ota_unpack_sync(&g_ota, payload, &sync) &&
             sync.uid4 == g_ota.uid[4] &&
-            sync.uid5 == g_ota.uid[5]) {
+            (sync.uid5 & ~0x3FU) == (g_ota.uid[5] & ~0x3FU)) {
             g_crc_ok_count++;
             g_sync_rx_count++;
             g_last_valid_pkt_ms = hal_millis();
-            g_ota.ota_nonce     = sync.nonce;
+
+            bool need_reanchor = (g_lock_state == LOCK_DISCONNECTED) ||
+                                 (g_ota.ota_nonce != sync.nonce) ||
+                                 (g_fhss.hop_ptr != sync.fhss_index);
+
+            g_ota.ota_nonce   = sync.nonce;
+            g_ota.switch_mode = (elrs_switch_mode_t)sync.switch_enc_mode;
+            g_tlm_denom       = (sync.new_tlm_ratio == 0U)
+                                    ? 1U
+                                    : (uint8_t)(1U << (8U - sync.new_tlm_ratio));
             elrs_fhss_set_index(&g_fhss, sync.fhss_index);
 
             if (g_lock_state == LOCK_DISCONNECTED) {
-                g_lock_state     = LOCK_TENTATIVE;
-                g_rf_Consec_good = 1U;
-                /* Start or re-anchor hwTimer so Tock occurs (interval_us / 2) before next expected RX_DONE */
-                if (!hal_hwtimer_is_running()) {
-                    hal_hwtimer_start();
-                }
+                g_lock_state          = LOCK_TENTATIVE;
+                g_rf_Consec_good      = 1U;
+                g_tentative_slots     = 0U;
+                g_tentative_hops      = 0U;
+                g_tentative_from_pair = false;
             } else if (g_lock_state == LOCK_TENTATIVE) {
                 g_rf_Consec_good++;
                 if (g_rf_Consec_good >= 3U) {
@@ -392,13 +451,20 @@ static void radio_rx_done_isr(const uint8_t *payload, uint8_t len, const lr2021_
                 }
             }
 
-            /* Phase lock loop: target RX_DONE at (interval_us / 2) after Tock */
-            int32_t target_offset_us = (int32_t)(rate->interval_us >> 1U);
-            int32_t actual_offset_us = (int32_t)(irq_us - g_last_tock_us);
-            int32_t err_us           = actual_offset_us - target_offset_us;
-            g_last_phase_err_us      = err_us;
-            if (err_us > -2000 && err_us < 2000) {
-                hal_hwtimer_phase_shift(err_us / 2);
+            if (need_reanchor) {
+                /* Schedule TOCK 150 us after SYNC RX_DONE so OtaNonce++ and FHSS hop
+                 * occur right after SYNC reception, before the next TX packet starts.
+                 */
+                hal_hwtimer_anchor_tock_in_us(150U);
+                g_last_phase_err_us = 0;
+            } else {
+                int32_t target_offset_us = (int32_t)rate->interval_us - 150;
+                int32_t actual_offset_us = (int32_t)(irq_us - g_last_tock_us);
+                int32_t err_us           = actual_offset_us - target_offset_us;
+                g_last_phase_err_us      = err_us;
+                if (err_us > -400 && err_us < 400) {
+                    hal_hwtimer_phase_shift(err_us / 4);
+                }
             }
 
             if (g_app_mode == APP_MODE_MONITOR && g_monitor_verbose) {
@@ -409,11 +475,53 @@ static void radio_rx_done_isr(const uint8_t *payload, uint8_t len, const lr2021_
         }
     }
 
-    /* 2. If locked/tentative, validate with current OtaNonce */
+    /* 2. Fast sync-channel consecutive-nonce pair lock when TX is already connected */
+    if (g_lock_state == LOCK_DISCONNECTED && rate->fhss_hop_interval >= 2U) {
+        uint32_t dt_us = irq_us - g_prev_sync_ch_us;
+        uint32_t target_dt = rate->interval_us;
+        if (g_prev_sync_ch_us != 0U &&
+            dt_us >= (target_dt - 250U) &&
+            dt_us <= (target_dt + 250U)) {
+            for (uint16_t n = 0U; n < 256U; n++) {
+                uint8_t prev_n = (uint8_t)(n - 1U);
+                if ((prev_n % rate->fhss_hop_interval) == 0U &&
+                    elrs_ota_validate_crc(&g_ota, payload, (uint8_t)n) &&
+                    elrs_ota_validate_crc(&g_ota, g_prev_sync_ch_pkt, prev_n)) {
+                    g_ota.ota_nonce       = (uint8_t)n;
+                    g_ota.switch_mode     = ELRS_SW_HYBRID_OR_16CH;
+                    g_tlm_denom           = 2U;
+                    elrs_fhss_set_index(&g_fhss, 0U);
+                    g_lock_state          = LOCK_TENTATIVE;
+                    g_rf_Consec_good      = 1U;
+                    g_tentative_slots     = 0U;
+                    g_tentative_hops      = 0U;
+                    g_tentative_from_pair = true;
+                    g_last_valid_pkt_ms   = hal_millis();
+                    g_crc_ok_count++;
+                    hal_hwtimer_anchor_tock_in_us(150U);
+                    g_prev_sync_ch_us     = 0U;
+                    return;
+                }
+            }
+        }
+        g_prev_sync_ch_us = irq_us;
+        if (len <= sizeof(g_prev_sync_ch_pkt)) {
+            memcpy(g_prev_sync_ch_pkt, payload, len);
+        }
+    }
+
+    /* 3. If locked/tentative, validate with current OtaNonce */
     if (g_lock_state != LOCK_DISCONNECTED) {
         bool valid = false;
-        if (is_telemetry_slot(g_ota.ota_nonce, g_tlm_denom) && g_app_mode == APP_MODE_MONITOR) {
-            /* Sniffing RX downlink telemetry slot in passive monitor mode! */
+        if (!g_ota.is_full_res && (g_ota.ota_nonce & 1U) == 0U &&
+            pkt_type == ELRS_PKT_TYPE_LINKSTATS &&
+            payload[1] == 0x00U && payload[6] == 0x00U &&
+            elrs_ota_validate_crc(&g_ota, payload, g_ota.ota_nonce)) {
+            g_tlm_denom = 2U;
+        }
+        bool is_tlm = is_telemetry_slot(g_ota.ota_nonce, g_tlm_denom);
+        if (is_tlm) {
+            /* Sniffing RX downlink telemetry slot in passive monitor or tentative RX mode */
             elrs_link_stats_data_t ls;
             uint8_t pkg_idx = 0U;
             bool ack = false;
@@ -441,33 +549,51 @@ static void radio_rx_done_isr(const uint8_t *payload, uint8_t len, const lr2021_
             g_got_pkt_this_slot = true;
             if (g_lock_state == LOCK_TENTATIVE) {
                 g_rf_Consec_good++;
-                if (g_rf_Consec_good >= 5U) {
+                if (g_rf_Consec_good >= 4U) {
                     g_lock_state = LOCK_CONNECTED;
                     hal_led_set(true);
                 }
             }
 
-            /* Continuous phase tracking on uplink packets */
-            if (!is_telemetry_slot(g_ota.ota_nonce, g_tlm_denom)) {
-                int32_t target_offset_us = (int32_t)(rate->interval_us >> 1U);
+            /* Continuous phase tracking on uplink packets (keep Tock 150 us after RX_DONE) */
+            if (!is_tlm) {
+                int32_t target_offset_us = (int32_t)rate->interval_us - 150;
                 int32_t actual_offset_us = (int32_t)(irq_us - g_last_tock_us);
                 int32_t err_us           = actual_offset_us - target_offset_us;
                 g_last_phase_err_us      = err_us;
-                if (err_us > -1500 && err_us < 1500) {
-                    hal_hwtimer_phase_shift(err_us / 4);
+                if (err_us > -400 && err_us < 400) {
+                    hal_hwtimer_phase_shift(err_us / 8);
                 }
             }
 
-            /* In Active RX mode, forward unpacked RC channels to Flight Controller over 420k CRSF UART */
-            if (g_app_mode == APP_MODE_ELRS_RX && pkt_type == ELRS_PKT_TYPE_RCDATA) {
-                uint8_t crsf_frame[26];
-                crsf_build_rc_channels_frame(g_rc_channels, crsf_frame);
-                hal_crsf_uart_write(crsf_frame, sizeof(crsf_frame));
+            /* In Active RX mode, schedule CRSF RC frame output on main loop so ISR never blocks */
+            if (g_app_mode == APP_MODE_ELRS_RX && !is_tlm && pkt_type == ELRS_PKT_TYPE_RCDATA) {
+                g_crsf_rc_pending = true;
             }
 
             if (g_app_mode == APP_MODE_MONITOR && g_monitor_verbose) {
-                push_mon_event(curr_freq, g_ota.ota_nonce, (uint8_t)g_fhss.hop_ptr,
-                               pkt_type, true, stats, payload, len);
+                static uint32_t last_rc_mon_ms  = 0U;
+                static uint32_t last_tlm_mon_ms = 0U;
+                uint32_t now_ms = hal_millis();
+                bool do_log = false;
+                if (is_tlm) {
+                    if ((now_ms - last_tlm_mon_ms) >= 100U) {
+                        last_tlm_mon_ms = now_ms;
+                        do_log = true;
+                    }
+                } else if (pkt_type == ELRS_PKT_TYPE_RCDATA) {
+                    if ((now_ms - last_rc_mon_ms) >= 100U) {
+                        last_rc_mon_ms = now_ms;
+                        do_log = true;
+                    }
+                } else {
+                    do_log = true;
+                }
+                if (do_log) {
+                    uint8_t log_type = is_tlm ? 0xFEU : pkt_type;
+                    push_mon_event(curr_freq, g_ota.ota_nonce, (uint8_t)g_fhss.hop_ptr,
+                                   log_type, true, stats, payload, len);
+                }
             }
             return;
         }
@@ -475,15 +601,13 @@ static void radio_rx_done_isr(const uint8_t *payload, uint8_t len, const lr2021_
 
     g_crc_fail_count++;
     if (g_app_mode == APP_MODE_MONITOR && g_monitor_verbose && g_lock_state == LOCK_DISCONNECTED) {
-        /* If unlocked in monitor mode and a SYNC-type header arrives, check if its self-contained UID4/UID5 CRC matches! */
-        if (pkt_type == ELRS_PKT_TYPE_SYNC && (len == ELRS_OTA4_PACKET_SIZE || len == ELRS_OTA8_PACKET_SIZE)) {
-            uint8_t candidate_uid[6] = {0, 0, 0, 0, payload[5], payload[6]};
-            elrs_ota_state_t tmp_ota;
-            elrs_ota_init(&tmp_ota, candidate_uid, len, ELRS_SW_WIDE_OR_8CH);
-            if (elrs_ota_validate_crc(&tmp_ota, payload, 0U)) {
-                push_mon_event(curr_freq, payload[2], payload[1], pkt_type, true, stats, payload, len);
-            }
+        if ((rate->phy_type != ELRS_PHY_FSK_2G4 && rate->phy_type != ELRS_PHY_FSK_900) ||
+            stats->rssi_dbm > -75) {
+            push_mon_event(curr_freq, payload[2], payload[1], pkt_type, false, stats, payload, len);
         }
+    }
+    if (g_lock_state == LOCK_DISCONNECTED) {
+        lr2021_rx_nb();
     }
 }
 
@@ -514,16 +638,31 @@ static const char *lock_to_str(lock_state_t l) {
 
 static void start_mode(app_mode_t new_mode) {
     hal_hwtimer_stop();
+    hal_radio_irq_enable(false);
     lr2021_set_mode(LR2021_MODE_STDBY_XOSC);
-    g_app_mode       = new_mode;
-    g_lock_state     = LOCK_DISCONNECTED;
-    g_rf_Consec_good = 0U;
+    lr2021_clear_irq();
+    g_app_mode            = new_mode;
+    g_lock_state          = LOCK_DISCONNECTED;
+    g_rf_Consec_good      = 0U;
+    g_tentative_slots     = 0U;
+    g_tentative_hops      = 0U;
+    g_tentative_from_pair = false;
+    g_prev_sync_ch_us     = 0U;
     hal_led_set(false);
 
     if (new_mode == APP_MODE_IDLE) {
         hal_usb_uart_printf("[MODE] Switched to IDLE (STDBY_XOSC)\r\n");
         return;
     }
+
+    lr2021_reset_counters();
+    g_crc_ok_count      = 0U;
+    g_crc_fail_count    = 0U;
+    g_sync_rx_count     = 0U;
+    g_rc_rx_count       = 0U;
+    g_tlm_rx_count      = 0U;
+    g_fhss_hop_count    = 0U;
+    g_last_phase_err_us = 0;
 
     if (new_mode == APP_MODE_BRIDGE) {
         lr2021_config_flrc(LR2021_RADIO_FLRC_BR_0_650_BW_0_6,
@@ -535,6 +674,8 @@ static void start_mode(app_mode_t new_mode) {
                            0x4E08U,
                            g_bridge_pkt_len);
         lr2021_set_tx_power_dbm(g_tx_power_dbm, g_bridge_freq_hz < 1000000000UL);
+        lr2021_clear_irq();
+        hal_radio_irq_enable(true);
         lr2021_rx_nb();
         hal_usb_uart_printf("[MODE] Switched to BRIDGE (FLRC %lu Hz, %uB payload, RX continuous)\r\n",
                             (unsigned long)g_bridge_freq_hz, g_bridge_pkt_len);
@@ -547,6 +688,8 @@ static void start_mode(app_mode_t new_mode) {
     if (new_mode == APP_MODE_ELRS_TX) {
         g_lock_state      = LOCK_CONNECTED;
         g_last_sync_tx_ms = 0U;
+        lr2021_clear_irq();
+        hal_radio_irq_enable(true);
         hal_hwtimer_init(rate->interval_us, elrs_hwtimer_tick_cb, elrs_hwtimer_tock_cb);
         hal_hwtimer_start();
         hal_led_set(true);
@@ -559,6 +702,8 @@ static void start_mode(app_mode_t new_mode) {
     } else if (new_mode == APP_MODE_ELRS_RX || new_mode == APP_MODE_MONITOR) {
         hal_hwtimer_init(rate->interval_us, elrs_hwtimer_tick_cb, elrs_hwtimer_tock_cb);
         uint32_t sync_freq = elrs_fhss_get_initial_freq(&g_fhss);
+        lr2021_clear_irq();
+        hal_radio_irq_enable(true);
         lr2021_set_frequency(sync_freq, true);
         hal_usb_uart_printf("[MODE] Started %s waiting for SYNC on %lu Hz (rate=%s domain=%s UID=%02X:%02X:%02X:%02X:%02X:%02X)\r\n",
                             mode_to_str(new_mode),
@@ -572,8 +717,12 @@ static void start_mode(app_mode_t new_mode) {
 
 static void print_status(void) {
     const elrs_air_rate_config_t *rate = elrs_get_air_rate_by_index(g_rate_idx);
-    uint16_t ver = lr2021_get_version();
-    uint16_t err = lr2021_get_errors();
+    uint16_t ver = g_chip_version;
+    uint16_t err = 0U;
+    if (g_app_mode == APP_MODE_IDLE) {
+        ver = lr2021_get_version();
+        err = lr2021_get_errors();
+    }
 
     hal_usb_uart_printf(
         "STATUS mode=%s lock=%s chip=0x%04X err=0x%04X domain=%s rate=%s(%u) "
@@ -610,6 +759,10 @@ static void print_status(void) {
         hal_usb_uart_printf(" ch%d=%u", i + 1, crsf_ticks_to_us(g_rc_channels[i]));
     }
     hal_usb_uart_printf(" armed=%u\r\n", g_rc_is_armed ? 1U : 0U);
+    hal_usb_uart_printf("TLM_LINK uplink_rssi=-%udBm lq=%u%% snr=%ddB\r\n",
+                        (unsigned)g_downlink_rssi,
+                        (unsigned)g_downlink_lq,
+                        (int)g_downlink_snr);
 }
 
 static void handle_cli_command(char *line) {
@@ -718,11 +871,11 @@ static void handle_cli_command(char *line) {
             hal_usb_uart_puts("ERR: usage: domain <fcc915|au915|eu868|ism2g4>\r\n");
             return;
         }
-        if (strcasecmp(arg, "fcc915") == 0) g_domain = ELRS_DOMAIN_FCC915;
-        else if (strcasecmp(arg, "au915") == 0) g_domain = ELRS_DOMAIN_AU915;
-        else if (strcasecmp(arg, "eu868") == 0) g_domain = ELRS_DOMAIN_EU868;
-        else if (strcasecmp(arg, "ism2g4") == 0 || strcasecmp(arg, "ism2400") == 0) g_domain = ELRS_DOMAIN_ISM2G4;
-        else if (strcasecmp(arg, "ce2g4") == 0) g_domain = ELRS_DOMAIN_CE2G4;
+        if (strcasecmp(arg, "fcc915") == 0) { g_domain = ELRS_DOMAIN_FCC915; g_subghz_domain = g_domain; }
+        else if (strcasecmp(arg, "au915") == 0) { g_domain = ELRS_DOMAIN_AU915; g_subghz_domain = g_domain; }
+        else if (strcasecmp(arg, "eu868") == 0) { g_domain = ELRS_DOMAIN_EU868; g_subghz_domain = g_domain; }
+        else if (strcasecmp(arg, "ism2g4") == 0 || strcasecmp(arg, "ism2400") == 0) { g_domain = ELRS_DOMAIN_ISM2G4; g_2g4_domain = g_domain; }
+        else if (strcasecmp(arg, "ce2g4") == 0 || strcasecmp(arg, "ce_lbt") == 0) { g_domain = ELRS_DOMAIN_CE2G4; g_2g4_domain = g_domain; }
         else {
             hal_usb_uart_printf("ERR: unknown domain %s\r\n", arg);
             return;
@@ -826,7 +979,7 @@ static void handle_cli_command(char *line) {
     if (strcmp(cmd, "pong") == 0) {
         char *f_arg = strtok(NULL, " ");
         char *m_arg = strtok(NULL, " ");
-        uint32_t freq_hz = f_arg ? (uint32_t)strtoul(f_arg, NULL, 10) : 915000000UL;
+        uint32_t freq_hz = f_arg ? (uint32_t)strtoul(f_arg, NULL, 10) : 868000000UL;
         bool use_flrc    = (m_arg && strcasecmp(m_arg, "flrc") == 0);
 
         hal_hwtimer_stop();
@@ -852,7 +1005,7 @@ static void handle_cli_command(char *line) {
         char *f_arg = strtok(NULL, " ");
         char *m_arg = strtok(NULL, " ");
         char *c_arg = strtok(NULL, " ");
-        uint32_t freq_hz = f_arg ? (uint32_t)strtoul(f_arg, NULL, 10) : 915000000UL;
+        uint32_t freq_hz = f_arg ? (uint32_t)strtoul(f_arg, NULL, 10) : 868000000UL;
         bool use_flrc    = (m_arg && strcasecmp(m_arg, "flrc") == 0);
         uint32_t count   = c_arg ? (uint32_t)strtoul(c_arg, NULL, 10) : 5U;
 
@@ -929,19 +1082,37 @@ static void handle_cli_command(char *line) {
     }
 
     if (strcmp(cmd, "scan") == 0) {
-        char *band = strtok(NULL, " ");
-        bool is_2g4 = (band && (strcmp(band, "2400") == 0 || strcasecmp(band, "2g4") == 0));
+        char *arg1 = strtok(NULL, " ");
+        char *arg2 = strtok(NULL, " ");
+        char *arg3 = strtok(NULL, " ");
         hal_hwtimer_stop();
-        uint32_t f_start = is_2g4 ? 2400000000UL : 903000000UL;
-        uint32_t f_stop  = is_2g4 ? 2480000000UL : 927000000UL;
-        uint32_t f_step  = is_2g4 ? 2000000UL    : 600000UL;
+        uint32_t f_start = 863000000UL;
+        uint32_t f_stop  = 870000000UL;
+        uint32_t f_step  = 250000UL;
+        bool is_2g4      = false;
+        bool is_900      = false;
+
+        if (arg1 && arg2 && arg3) {
+            f_start = (uint32_t)strtoul(arg1, NULL, 10);
+            f_stop  = (uint32_t)strtoul(arg2, NULL, 10);
+            f_step  = (uint32_t)strtoul(arg3, NULL, 10);
+            if (f_step == 0U) f_step = 250000UL;
+            is_2g4 = (f_start >= 1000000000UL);
+            is_900 = (!is_2g4 && f_start >= 900000000UL);
+        } else {
+            is_2g4 = (arg1 && (strcmp(arg1, "2400") == 0 || strcasecmp(arg1, "2g4") == 0));
+            is_900 = (arg1 && strcmp(arg1, "900") == 0);
+            f_start = is_2g4 ? 2400000000UL : (is_900 ? 903000000UL : 863000000UL);
+            f_stop  = is_2g4 ? 2480000000UL : (is_900 ? 927000000UL : 870000000UL);
+            f_step  = is_2g4 ? 2000000UL    : (is_900 ? 600000UL    : 250000UL);
+        }
 
         uint8_t bw = is_2g4 ? LR2021_RADIO_LORA_BW_800 : LR2021_RADIO_LORA_BW_500;
         lr2021_config_lora(bw, LR2021_RADIO_LORA_SF6, LR2021_RADIO_LORA_CR_4_7,
                            f_start, 12U, false, 8U, false, false);
 
         hal_usb_uart_printf("SCAN_START band=%s start=%lu stop=%lu step=%lu\r\n",
-                            is_2g4 ? "2.4GHz" : "900MHz",
+                            is_2g4 ? "2.4GHz" : (is_900 ? "900MHz" : "868MHz"),
                             (unsigned long)f_start, (unsigned long)f_stop, (unsigned long)f_step);
         for (uint32_t f = f_start; f <= f_stop; f += f_step) {
             lr2021_set_mode(LR2021_MODE_FS);
@@ -979,20 +1150,21 @@ int main(void) {
 
     /* Default binding phrase */
     uint8_t default_uid[6];
-    elrs_uid_from_bind_phrase("lr2021-elrs", default_uid);
+    elrs_uid_from_bind_phrase("WinniePico", default_uid);
     elrs_ota_init(&g_ota, default_uid, ELRS_OTA4_PACKET_SIZE, ELRS_SW_WIDE_OR_8CH);
     elrs_fhss_init(&g_fhss, g_domain, g_ota.uid_seed);
 
     lr2021_set_callbacks(radio_rx_done_isr, radio_tx_done_isr);
 
     uint16_t chip_ver = 0U;
-    bool radio_ok = lr2021_begin(915000000UL, 2440000000UL, &chip_ver);
+    bool radio_ok = lr2021_begin(868000000UL, 2440000000UL, &chip_ver);
+    g_chip_version = chip_ver;
 
     hal_usb_uart_printf("\r\n========================================================\r\n");
     hal_usb_uart_printf("LR2021-ELRS Bare-Metal Firmware (XIAO nRF54L15 @ 128MHz)\r\n");
     hal_usb_uart_printf("LR2021 Init: %s (Version=0x%04X, Errors=0x%04X)\r\n",
                         radio_ok ? "OK" : "FAIL", chip_ver, lr2021_get_errors());
-    hal_usb_uart_printf("Default UID: %02X:%02X:%02X:%02X:%02X:%02X (phrase=\"lr2021-elrs\")\r\n",
+    hal_usb_uart_printf("Default UID: %02X:%02X:%02X:%02X:%02X:%02X (phrase=\"WinniePico\")\r\n",
                         g_ota.uid[0], g_ota.uid[1], g_ota.uid[2],
                         g_ota.uid[3], g_ota.uid[4], g_ota.uid[5]);
     hal_usb_uart_printf("========================================================\r\n");
@@ -1029,7 +1201,13 @@ int main(void) {
             }
         }
 
-        /* 3. In Active RX mode, send periodic CRSF_FRAMETYPE_LINK_STATISTICS (0x14) to Flight Controller */
+        /* 3. In Active RX mode, forward CRSF RC channels & periodic LINK_STATISTICS (0x14) to FC */
+        if (g_app_mode == APP_MODE_ELRS_RX && g_crsf_rc_pending) {
+            g_crsf_rc_pending = false;
+            uint8_t crsf_frame[26];
+            crsf_build_rc_channels_frame(g_rc_channels, crsf_frame);
+            hal_crsf_uart_write(crsf_frame, sizeof(crsf_frame));
+        }
         uint32_t now_ms = hal_millis();
         if (g_app_mode == APP_MODE_ELRS_RX && g_lock_state == LOCK_CONNECTED &&
             (now_ms - last_crsf_linkstats_ms) >= 100U) {
@@ -1052,25 +1230,29 @@ int main(void) {
             hal_crsf_uart_write(frame, sizeof(frame));
         }
 
-        /* 4. Drain deferred MONITOR events or BRIDGE packets to USB console */
-        while (g_mon_tail != g_mon_head) {
+        /* 4. Drain at most 1 deferred MONITOR event per loop iteration so CLI never starves */
+        if (g_mon_tail != g_mon_head) {
             mon_event_t ev = g_mon_ring[g_mon_tail];
             g_mon_tail = (g_mon_tail + 1U) & (MON_RING_SIZE - 1U);
             const char *tstr = (ev.pkt_type == ELRS_PKT_TYPE_SYNC) ? "SYNC" :
+                               (ev.pkt_type == 0xFEU) ? "TLM" :
                                (ev.pkt_type == ELRS_PKT_TYPE_RCDATA) ? "RC" : "DATA";
             hal_usb_uart_printf(
-                "MON t=%lu freq=%lu nonce=%3u hop=%3u type=%-4s rssi=%4d snr=%2d ch=[%4u,%4u,%4u,%4u] raw=%02X%02X%02X%02X%02X%02X%02X%02X\r\n",
+                "MON t=%lu freq=%lu nonce=%3u hop=%3u type=%-4s crc=%u rssi=%4d snr=%2d ch=[%4u,%4u,%4u,%4u] raw=",
                 (unsigned long)ev.timestamp_us,
                 (unsigned long)ev.freq_hz,
                 ev.nonce,
                 ev.hop_idx,
                 tstr,
+                ev.crc_ok ? 1U : 0U,
                 (int)ev.rssi_dbm,
                 (int)(ev.snr_q2 / 4),
-                ev.ch_us[0], ev.ch_us[1], ev.ch_us[2], ev.ch_us[3],
-                ev.raw[0], ev.raw[1], ev.raw[2], ev.raw[3],
-                ev.raw[4], ev.raw[5], ev.raw[6], ev.raw[7]
+                ev.ch_us[0], ev.ch_us[1], ev.ch_us[2], ev.ch_us[3]
             );
+            for (uint8_t i = 0U; i < ev.raw_len; i++) {
+                hal_usb_uart_printf("%02X", ev.raw[i]);
+            }
+            hal_usb_uart_puts("\r\n");
         }
 
         if (g_app_mode == APP_MODE_BRIDGE && g_ping_rx_flag) {

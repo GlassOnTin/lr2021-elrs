@@ -112,6 +112,7 @@ void lr2021_read_rx_fifo(uint8_t *out_buf, uint8_t len);
 uint32_t lr2021_get_irq_count(void);
 uint32_t lr2021_get_rx_done_count(void);
 uint32_t lr2021_get_tx_done_count(void);
+void lr2021_reset_counters(void);
 
 #ifdef __cplusplus
 }
