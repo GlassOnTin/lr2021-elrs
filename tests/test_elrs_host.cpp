@@ -212,11 +212,71 @@ static void test_crsf_framing(void) {
     printf("[PASS] test_crsf_framing (RC_CHANNELS 0x16, LINK_STATISTICS 0x14, stream parser)\n");
 }
 
+static void test_demo_live_packets(void) {
+    /* Verify live OTA packets captured from RadioMaster TX16SMK3 <-> RadioMaster XR4
+     * Binding phrase: "lr2021-elrs-demo" -> UID = 0A:B7:0C:7C:38:03
+     * Air rate: 2G4_K1000 (ELRS_RATE_FSK_2G4_1000HZ = 0x24 = 36), CE_LBT domain
+     */
+    uint8_t uid[6] = {0};
+    elrs_uid_from_bind_phrase("lr2021-elrs-demo", uid);
+    const uint8_t expected_uid[6] = {0x0A, 0xB7, 0x0C, 0x7C, 0x38, 0x03};
+    assert(memcmp(uid, expected_uid, 6) == 0);
+
+    elrs_ota_state_t ota;
+    elrs_ota_init(&ota, uid, ELRS_OTA4_PACKET_SIZE, ELRS_SW_HYBRID_OR_16CH);
+    assert(ota.uid_seed == 0x09FA466EUL);
+    assert(ota.crc_init == 0x426AU);
+
+    /* 1. Live TX16SMK3 SYNC packet at hop=160, nonce=193: AAA0C1240F466AD3 */
+    const uint8_t sync_pkt_160[8] = {0xAA, 0xA0, 0xC1, 0x24, 0x0F, 0x46, 0x6A, 0xD3};
+    elrs_sync_data_t sync = {};
+    assert(elrs_ota_unpack_sync(&ota, sync_pkt_160, &sync));
+    assert(sync.fhss_index == 160U);
+    assert(sync.nonce == 193U);
+    assert(sync.rf_rate_enum == ELRS_RATE_FSK_2G4_1000HZ);
+    assert(sync.switch_enc_mode == ELRS_SW_HYBRID_OR_16CH);
+    assert(sync.new_tlm_ratio == 7U); /* 1:2 telemetry ratio */
+    assert(sync.uid4 == 0x46U && sync.uid5 == 0x6AU);
+
+    /* 2. Live TX16SMK3 SYNC packet at hop=0, nonce=193: 6200C1240F466A99 */
+    const uint8_t sync_pkt_0[8] = {0x62, 0x00, 0xC1, 0x24, 0x0F, 0x46, 0x6A, 0x99};
+    assert(elrs_ota_unpack_sync(&ota, sync_pkt_0, &sync));
+    assert(sync.fhss_index == 0U);
+    assert(sync.nonce == 193U);
+
+    /* 3. Live XR4 LINKSTATS telemetry packet at hop=1, nonce=194: 6400CAB9E00000C4 */
+    const uint8_t tlm_pkt[8] = {0x64, 0x00, 0xCA, 0xB9, 0xE0, 0x00, 0x00, 0xC4};
+    ota.ota_nonce = 194U;
+    elrs_link_stats_data_t ls = {};
+    uint8_t pkg_idx = 0U;
+    bool ack = false;
+    assert(elrs_ota_unpack_linkstats(&ota, tlm_pkt, &ls, &pkg_idx, &ack));
+    assert(ls.uplink_rssi_1 == 74U);
+    assert(ls.uplink_rssi_2 == 57U);
+    assert(ls.lq == 96U);
+    assert(ls.true_diversity == 1U);
+
+    /* 4. Live TX16SMK3 RCDATA packet at hop=1, nonce=195: 68000218807F401E */
+    const uint8_t rc_pkt[8] = {0x68, 0x00, 0x02, 0x18, 0x80, 0x7F, 0x40, 0x1E};
+    ota.ota_nonce = 195U;
+    uint16_t ch[16] = {0};
+    bool armed = true;
+    assert(elrs_ota_unpack_rc(&ota, rc_pkt, ch, &armed, &ack));
+    assert(!armed);
+    assert(crsf_ticks_to_us(ch[0]) == 1500U);
+    assert(crsf_ticks_to_us(ch[1]) == 1500U);
+    assert(crsf_ticks_to_us(ch[2]) == 989U);
+    assert(crsf_ticks_to_us(ch[3]) == 1498U);
+
+    printf("[PASS] test_demo_live_packets (TX16SMK3 SYNC + RCDATA, XR4 LINKSTATS)\n");
+}
+
 int main(void) {
     test_uid_md5();
     test_fhss_invariants();
     test_ota4_and_ota8_roundtrip();
     test_crsf_framing();
+    test_demo_live_packets();
     printf("All host unit tests PASSED.\n");
     return 0;
 }

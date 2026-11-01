@@ -21,21 +21,7 @@ if [[ ! -f "${IMAGE}" ]]; then
     exit 1
 fi
 
-USB_LOC=""
-for f in /sys/bus/usb/devices/*/serial; do
-    if [[ -r "$f" ]] && [[ "$(cat "$f" 2>/dev/null || true)" == "${SERIAL}" ]]; then
-        USB_LOC="$(basename "$(dirname "$f")")"
-        break
-    fi
-done
-
-LOC_ARGS=(-c "adapter serial ${SERIAL}")
-if [[ -n "${USB_LOC}" ]]; then
-    echo "Resolved ${SERIAL} at USB location ${USB_LOC}"
-    LOC_ARGS+=(-c "adapter usb location ${USB_LOC}")
-fi
-
 openocd \
-    "${LOC_ARGS[@]}" \
+    -c "adapter serial ${SERIAL}" \
     -f "${REPO_ROOT}/openocd/xiao_nrf54l15.cfg" \
     -c "init; nrf54l_flash_image ${IMAGE}; shutdown"

@@ -93,19 +93,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_cfg.add_argument("--power", type=int, help="TX power in dBm (-9..22 LF, -19..12 HF)")
     p_cfg.add_argument("--mode", choices=["idle", "tx", "rx", "monitor", "bridge"])
 
-    p_ping = sub.add_parser("ping", help="Run active RF ping test on 900 MHz or 2.4 GHz")
-    p_ping.add_argument("--freq", type=int, default=915000000, help="Frequency in Hz")
+    p_ping = sub.add_parser("ping", help="Run active RF ping test on 868/900 MHz or 2.4 GHz")
+    p_ping.add_argument("--freq", type=int, default=868000000, help="Frequency in Hz")
     p_ping.add_argument("--mod", choices=["lora", "flrc"], default="lora", help="Modulation")
     p_ping.add_argument("--count", type=int, default=5, help="Number of ping packets")
 
     p_pong = sub.add_parser("pong", help="Enter active RF pong responder mode")
-    p_pong.add_argument("--freq", type=int, default=915000000, help="Frequency in Hz")
+    p_pong.add_argument("--freq", type=int, default=868000000, help="Frequency in Hz")
     p_pong.add_argument("--mod", choices=["lora", "flrc"], default="lora", help="Modulation")
 
     p_scan = sub.add_parser("scan", help="Run RSSI spectral scan across a frequency band")
-    p_scan.add_argument("--start", type=int, default=903000000, help="Start frequency in Hz")
-    p_scan.add_argument("--stop", type=int, default=927000000, help="Stop frequency in Hz")
-    p_scan.add_argument("--step", type=int, default=600000, help="Frequency step in Hz")
+    p_scan.add_argument("--start", type=int, default=863000000, help="Start frequency in Hz")
+    p_scan.add_argument("--stop", type=int, default=870000000, help="Stop frequency in Hz")
+    p_scan.add_argument("--step", type=int, default=250000, help="Frequency step in Hz")
 
     p_mon = sub.add_parser("monitor", help="Stream live OTA packets in MONITOR/RX/TX mode")
     p_mon.add_argument("--duration", type=float, default=10.0, help="Duration in seconds")
@@ -144,7 +144,7 @@ def main() -> int:
             print(node.send_cmd("rates", wait_s=0.35))
         elif args.subcmd == "configure":
             if args.phrase is not None:
-                print(node.send_cmd(f"bind {args.phrase}", wait_s=0.25))
+                print(node.send_cmd(f"phrase {args.phrase}", wait_s=0.25))
             if args.uid is not None:
                 print(node.send_cmd(f"uid {args.uid}", wait_s=0.25))
             if args.domain is not None:

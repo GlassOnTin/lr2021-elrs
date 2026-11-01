@@ -232,7 +232,7 @@ void hal_init(void) {
     NRF_TIMER10_S->TASKS_CLEAR = 1UL;
     NRF_TIMER10_S->MODE        = 0UL; /* Timer mode */
     NRF_TIMER10_S->BITMODE     = 3UL; /* 32-bit width */
-    NRF_TIMER10_S->PRESCALER   = 4UL; /* 16 MHz / 2^4 = 1 MHz */
+    NRF_TIMER10_S->PRESCALER   = 5UL; /* 32 MHz PCLK32M / 2^5 = 1 MHz */
     NRF_TIMER10_S->TASKS_START = 1UL;
 
     /* 3. Configure GPIOs */
@@ -561,6 +561,21 @@ void hal_hwtimer_start(void) {
     g_hwtimer_phase_shift            = 0;
     NRF_TIMER20_S->CC[0]             = (g_hwtimer_interval_us >> 1U);
     NRF_TIMER20_S->INTENSET          = (1UL << 16U); /* COMPARE[0] interrupt */
+    g_hwtimer_running                = true;
+    NRF_TIMER20_S->TASKS_START       = 1UL;
+}
+
+void hal_hwtimer_anchor_tock_in_us(uint32_t delay_us) {
+    if (delay_us < 30U) {
+        delay_us = 30U;
+    }
+    NRF_TIMER20_S->TASKS_STOP        = 1UL;
+    NRF_TIMER20_S->TASKS_CLEAR       = 1UL;
+    NRF_TIMER20_S->EVENTS_COMPARE[0] = 0UL;
+    g_hwtimer_is_tick                = false; /* Next compare is TOCK */
+    g_hwtimer_phase_shift            = 0;
+    NRF_TIMER20_S->CC[0]             = delay_us;
+    NRF_TIMER20_S->INTENSET          = (1UL << 16U);
     g_hwtimer_running                = true;
     NRF_TIMER20_S->TASKS_START       = 1UL;
 }
