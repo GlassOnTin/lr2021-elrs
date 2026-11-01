@@ -207,7 +207,12 @@ Tested on two `LR2021EVK1XBS1_XIAO` boards (`FC6D1A37` and `D56B6941`), a live *
    ```
 3. **End-to-End Official Reticulum (`RNS 1.5.7` `RNodeInterface`) & Sideband (`io.unsigned.sideband` v1.9.8) ↔ 867.2 MHz LoRa RF ↔ Live `TMotorH743`:**
    - Verified transparent `RNODE_HW_MTU = 508` multi-frame LoRa fragmentation/reassembly (`<= 250 B` physical LoRa payloads with `0xFE 0xCA` framing) and non-blocking `BASEPRI` SPI critical sections so `UARTE22` / `UARTE21` RX interrupts never drop bytes during `CALIBRATE_FRONTEND`.
-   - Verified live Sideband announce discovery (`LR2021 Drone (TMotorH743) <dbe84551c59b392f43632c2982e3c6a4>`), `RNS.Link` establishment (`500 B` link MTU, `RTT = 560 ms`, `RSSI = -96 dBm`, `SNR = +14.25 dB`), bidirectional LXMF command execution (`rtl` and `mode 0` returning `ACK = 0`), quadcopter icon appearance (`FIELD_ICON_APPEARANCE`), and Sideband Telemetry screen rendering (`1024.17 mbar`, `38.5 °C`, `78.2%` / `16.01 V` battery, `Mode: RTL (6)`).
+   - Verified live Sideband announce discovery (`LR2021 Drone (TMotorH743) <dbe84551c59b392f43632c2982e3c6a4>`), `RNS.Link` establishment (`500 B` link MTU, `RTT = 560 ms`, `RSSI = -96 dBm`, `SNR = +14.25 dB`), bidirectional LXMF command execution (`rtl` and `mode 0` returning `ACK = 0`), quadcopter icon appearance (`FIELD_ICON_APPEARANCE`), and Sideband Telemetry screen rendering (`1024.17 mbar`, `38.5 °C`, `78.2%` / `16.01 V` battery, `Mode: RTL (6)`):
+
+   | Announce Discovery (`867.2 MHz`) | Contact & Quadcopter Icon | Bidirectional `rtl` -> `TMotorH743` | Live `TMotorH743` Telemetry |
+   | :---: | :---: | :---: | :---: |
+   | <img src="docs/images/sideband_announce_stream.png" width="210" alt="Sideband Announce Stream"/> | <img src="docs/images/sideband_conversations_quadcopter.png" width="210" alt="Sideband Quadcopter Contact"/> | <img src="docs/images/sideband_rtl_command_chat.png" width="210" alt="Sideband RTL Command Execution"/> | <img src="docs/images/sideband_telemetry_details.png" width="210" alt="Sideband Telemetry Details"/> |
+
 4. **Live 2.4 GHz `2G4_K1000` (`CE_LBT`, 80 channels, 1000 Hz GFSK + Hamming FEC, 1:2 telemetry) Passive `MONITOR` (`TX16SMK3` ↔ `XR4`):**
    - Captures 500 Hz TX16SMK3 uplink (`SYNC` + `RCDATA`) and 500 Hz XR4 downlink (`LINKSTATS` + CRSF telemetry `DATA` frames) simultaneously (`1,789 / 1,842 = 97.1%` combined packet CRC rate over `2.0 s`, `phase_err = 4 us`).
 
