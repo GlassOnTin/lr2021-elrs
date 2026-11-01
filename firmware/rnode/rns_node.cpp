@@ -474,6 +474,23 @@ bool rns_parse_drone_command_pkt(const uint8_t *pkt, size_t len, rns_drone_cmd_t
         out_cmd->type = RNS_DRONE_CMD_LAND;
         return true;
     }
+    if (strncmp(buf, "DISARM", 6) == 0) {
+        out_cmd->type = RNS_DRONE_CMD_DISARM;
+        return true;
+    }
+    if (strncmp(buf, "ARM", 3) == 0) {
+        out_cmd->type = RNS_DRONE_CMD_ARM;
+        return true;
+    }
+    if (strncmp(buf, "MODE ", 5) == 0) {
+        const char *p = buf + 5;
+        char *endp = NULL;
+        long m = strtol(p, &endp, 10);
+        if (endp == p || m < 0 || m > 255) return false;
+        out_cmd->type     = RNS_DRONE_CMD_SET_MODE;
+        out_cmd->mode_num = (uint8_t)m;
+        return true;
+    }
     if (strncmp(buf, "GOTO ", 5) == 0) {
         const char *p = buf + 5;
         char *endp = NULL;
@@ -490,7 +507,7 @@ bool rns_parse_drone_command_pkt(const uint8_t *pkt, size_t len, rns_drone_cmd_t
         out_cmd->alt_m      = (int32_t)alt;
         return true;
     }
-    if (strncmp(buf, "CH ", 3) == 0) {
+    if (strncmp(buf, "CH ", 3) == 0 || strncmp(buf, "RC ", 3) == 0) {
         const char *p = buf + 3;
         char *endp = NULL;
         for (uint8_t i = 0U; i < 4U; i++) {
@@ -557,6 +574,25 @@ size_t rns_build_mavlink_command(const rns_drone_cmd_t *cmd, uint8_t seq, uint8_
         write_u16_le(&payload[28], mav_cmd);
         payload[30] = 1U; /* target_system = 1 */
         payload[31] = 1U; /* target_component = 1 */
+    } else if (cmd->type == RNS_DRONE_CMD_SET_MODE) {
+        /* MAV_CMD_DO_SET_MODE (176, param1=MAV_MODE_FLAG_CUSTOM_MODE_ENABLED=1, param2=custom_mode) */
+        msg_id    = 76UL;
+        pay_len   = 33U;
+        crc_extra = 152U;
+        write_f32_le(&payload[0], 1.0f);
+        write_f32_le(&payload[4], (float)cmd->mode_num);
+        write_u16_le(&payload[28], 176U);
+        payload[30] = 1U;
+        payload[31] = 1U;
+    } else if (cmd->type == RNS_DRONE_CMD_ARM || cmd->type == RNS_DRONE_CMD_DISARM) {
+        /* MAV_CMD_COMPONENT_ARM_DISARM (400, param1=1.0 arm / 0.0 disarm) */
+        msg_id    = 76UL;
+        pay_len   = 33U;
+        crc_extra = 152U;
+        write_f32_le(&payload[0], (cmd->type == RNS_DRONE_CMD_ARM) ? 1.0f : 0.0f);
+        write_u16_le(&payload[28], 400U);
+        payload[30] = 1U;
+        payload[31] = 1U;
     } else if (cmd->type == RNS_DRONE_CMD_GUIDED_GOTO) {
         /* MAVLINK_MSG_ID_MISSION_ITEM_INT (73, len=37, CRC_EXTRA=38) */
         msg_id    = 73UL;
@@ -571,6 +607,16 @@ size_t rns_build_mavlink_command(const rns_drone_cmd_t *cmd, uint8_t seq, uint8_
         payload[34] = 6U; /* MAV_FRAME_GLOBAL_RELATIVE_ALT_INT */
         payload[35] = 2U; /* current = 2 (Guided mode target) */
         payload[36] = 1U; /* autocontinue = 1 */
+    } else if (cmd->type == RNS_DRONE_CMD_RC_OVERRIDE) {
+        /* MAVLINK_MSG_ID_RC_CHANNELS_OVERRIDE (70, len=18, CRC_EXTRA=124) */
+        msg_id    = 70UL;
+        pay_len   = 18U;
+        crc_extra = 124U;
+        for (uint8_t i = 0U; i < 4U; i++) {
+            write_u16_le(&payload[i * 2U], cmd->rc_us[i]);
+        }
+        payload[16] = 1U; /* target_system = 1 */
+        payload[17] = 1U; /* target_component = 1 */
     } else {
         return 0U;
     }
@@ -724,11 +770,17 @@ bool elrs_tunnel_process_rx_frame(elrs_data_tunnel_t *t,
 
     uint8_t seq_id = (uint8_t)((ota_pkt[1] >> 6U) & 0x03U);
     uint8_t fval   = (uint8_t)(ota_pkt[1] & 0x3FU);
-    if (seq_id == 0U || seq_id == t->last_completed_seq_id) {
+    if (seq_id == 0U) {
+        return false;
+    }
+    if (seq_id == t->last_completed_seq_id && fval != 0U) {
         return false;
     }
 
     if (fval == 0U) {
+        if (seq_id == t->last_completed_seq_id && t->rx_total_frags == 1U) {
+            return false;
+        }
         uint8_t total_frags = (uint8_t)(ota_pkt[2] & 0x3FU);
         if (total_frags == 0U || total_frags > ELRS_TUNNEL_MAX_FRAGS) {
             return false;
@@ -738,13 +790,14 @@ bool elrs_tunnel_process_rx_frame(elrs_data_tunnel_t *t,
         if (exp_len == 0U || exp_len > ELRS_TUNNEL_MAX_MTU) {
             return false;
         }
-        if (!t->rx_in_progress || t->rx_seq_id != seq_id) {
+        if (!t->rx_in_progress || t->rx_seq_id != seq_id || (t->rx_frag_bitmap & ~1ULL) != 0ULL) {
             memset(t->rx_buf, 0, sizeof(t->rx_buf));
-            t->rx_seq_id       = seq_id;
-            t->rx_total_frags  = total_frags;
-            t->rx_expected_len = exp_len;
-            t->rx_frag_bitmap  = 0ULL;
-            t->rx_in_progress  = true;
+            t->rx_seq_id             = seq_id;
+            t->rx_total_frags        = total_frags;
+            t->rx_expected_len       = exp_len;
+            t->rx_frag_bitmap        = 0ULL;
+            t->rx_in_progress        = true;
+            t->last_completed_seq_id = 0U;
         }
         uint16_t copy_len = is_ota8 ? ((exp_len < 6U) ? exp_len : 6U)
                                     : ((exp_len < 3U) ? exp_len : 3U);

@@ -76,8 +76,8 @@ When operating in `RELAY` mode on the drone:
 - **Uplink Drone Commands (`elrs.drone.cmd`, Destination Hash `734547db63023618ae2bd9a65187bafc`):**
   Incoming Reticulum packets addressed to `RNS_DEST_DRONE_CMD` are parsed by `rns_parse_drone_command_pkt()` and converted by `rns_build_mavlink_command()` into standard MAVLink v2 frames (with X.25 CRC-16/MCRF4XX and `CRC_EXTRA`) written to the flight controller UART:
   - `GOTO <lat_e7> <lon_e7> <alt_m>` -> 49-byte MAVLink v2 `MISSION_ITEM_INT` (`msgid = 73`, `MAV_CMD_NAV_WAYPOINT = 16`, `current = 2` guided mode target, `frame = MAV_FRAME_GLOBAL_RELATIVE_ALT_INT`).
-  - `RTL`, `LOITER`, `LAND`, `ARM`, `DISARM`, `MODE <custom_mode>` -> 45-byte MAVLink v2 `COMMAND_LONG` (`msgid = 76`).
-  - `RC <ch1_us> <ch2_us> <ch3_us> <ch4_us>` -> Updates local CRSF RC channels directly.
+  - `RTL`, `LOITER`, `LAND`, `ARM`, `DISARM`, `MODE <custom_mode>` -> 45-byte MAVLink v2 `COMMAND_LONG` (`msgid = 76`, `MAV_CMD_NAV_RETURN_TO_LAUNCH = 20`, `MAV_CMD_NAV_LOITER_UNLIM = 17`, `MAV_CMD_NAV_LAND = 21`, `MAV_CMD_COMPONENT_ARM_DISARM = 400`, `MAV_CMD_DO_SET_MODE = 176`).
+  - `RC <ch1_us> <ch2_us> <ch3_us> <ch4_us>` -> Updates local CRSF RC channels AND emits a 30-byte MAVLink v2 `RC_CHANNELS_OVERRIDE` (`msgid = 70`, `CRC_EXTRA = 124`) frame (`RC 0 0 0 0` releases the MAVLink RC override back to the hardware RC receiver).
 
 ### 2.5 ExpressLRS `ELRS_PKT_TYPE_DATA` (`0x01`) FHSS Tunnel
 

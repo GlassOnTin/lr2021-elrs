@@ -210,6 +210,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Port power action",
     )
 
+    p_fcb = sub.add_parser("fc-bridge", help="Bidirectional MAVLink v2 bridge between Flight Controller and LR2021 EVK")
+    p_fcb.add_argument("--fc-port", default="/dev/ttyACM4", help="Flight Controller MAVLink serial port (default: /dev/ttyACM4)")
+    p_fcb.add_argument("--fc-baud", type=int, default=115200, help="Flight Controller serial baud rate")
+    p_fcb.add_argument("--duration", type=float, default=30.0, help="Bridge run duration in seconds (0 for infinite)")
+    p_fcb.add_argument("--beacon-interval", type=float, default=5.0, help="Seconds between Reticulum rnlog.beacon broadcasts (0 to disable)")
+
     return parser
 
 
@@ -223,7 +229,7 @@ def main() -> int:
         return 0
 
     if args.subcmd == "hub":
-        cmd = ["uhubctl", "-l", args.location]
+        cmd = ["uhubctl", "-S", "-l", args.location]
         if args.hub_port is not None:
             cmd.extend(["-p", str(args.hub_port)])
         if args.action != "status":
@@ -311,6 +317,82 @@ def main() -> int:
                 line = node.ser.readline().decode("utf-8", errors="replace").strip()
                 if line:
                     print(line)
+        elif args.subcmd == "fc-bridge":
+            fc_ser = serial.Serial(args.fc_port, args.fc_baud, timeout=0.02)
+            try:
+                # Send MAVLink v2 REQUEST_DATA_STREAM (msg_id=66, stream=0 ALL, rate=4 Hz, start=1)
+                req_ds = bytes.fromhex("FD06000000FFBE420000040001010001059F")
+                fc_ser.write(req_ds)
+                fc_buf = bytearray()
+                last_bcn_t = time.monotonic()
+                start_t = time.monotonic()
+                last_tlm_sync = {0: 0.0, 1: 0.0, 33: 0.0}
+                print(f"[FC-BRIDGE] Bridging Flight Controller ({args.fc_port}) <-> LR2021 EVK ({args.port})")
+                while args.duration <= 0 or (time.monotonic() - start_t) < args.duration:
+                    # 1. Read incoming MAVLink v2 frames from Flight Controller
+                    chunk = fc_ser.read(4096)
+                    if chunk:
+                        fc_buf.extend(chunk)
+                    while len(fc_buf) >= 12:
+                        if fc_buf[0] != 0xFD:
+                            idx = fc_buf.find(b"\xFD")
+                            if idx < 0:
+                                fc_buf.clear()
+                                break
+                            del fc_buf[:idx]
+                            if len(fc_buf) < 12:
+                                break
+                        plen = fc_buf[1]
+                        incompat = fc_buf[2]
+                        total_len = 12 + plen + (13 if (incompat & 0x01) else 0)
+                        if len(fc_buf) < total_len:
+                            break
+                        frame = bytes(fc_buf[:total_len])
+                        del fc_buf[:total_len]
+                        msg_id = frame[7] | (frame[8] << 8) | (frame[9] << 16)
+                        now_m = time.monotonic()
+                        if msg_id in (0, 1, 33) and (now_m - last_tlm_sync[msg_id]) >= 0.5:
+                            last_tlm_sync[msg_id] = now_m
+                            resp = node.send_cmd("mav_rx " + frame.hex().upper(), wait_s=0.05)
+                            if resp:
+                                for rline in resp.splitlines():
+                                    if "RNS_CMD_RX" in rline or "ELRS_RNS_RX" in rline:
+                                        print(f"[EVK] {rline}")
+                                        if "mav_hex=" in rline:
+                                            parts = rline.split("mav_hex=")[1].split()
+                                            if parts:
+                                                fc_ser.write(bytes.fromhex(parts[0]))
+                        elif msg_id == 77 and plen >= 3:
+                            cmd_id = frame[10] | (frame[11] << 8)
+                            res_code = frame[12]
+                            print(f"[FC ACK] COMMAND_ACK cmd={cmd_id} result={res_code}")
+                        elif msg_id == 47 and plen >= 3:
+                            ack_type = frame[12]
+                            print(f"[FC ACK] MISSION_ACK type={ack_type}")
+
+                    # 2. Check incoming Reticulum commands / events from LR2021 EVK
+                    while node.ser.in_waiting > 0:
+                        eline = node.ser.readline().decode("utf-8", errors="replace").strip()
+                        if not eline:
+                            break
+                        if not eline.startswith("OK MAV_RX"):
+                            print(f"[EVK] {eline}")
+                        if "mav_hex=" in eline:
+                            parts = eline.split("mav_hex=")[1].split()
+                            if parts:
+                                mav_raw = bytes.fromhex(parts[0])
+                                fc_ser.write(mav_raw)
+                                fc_ser.flush()
+                                print(f"[EVK -> FC] Forwarded {len(mav_raw)}B MAVLink v2 command to {args.fc_port}")
+
+                    # 3. Periodic Reticulum beacon broadcast
+                    if args.beacon_interval > 0 and (time.monotonic() - last_bcn_t) >= args.beacon_interval:
+                        last_bcn_t = time.monotonic()
+                        bresp = node.send_cmd("bcn now", wait_s=0.1)
+                        if bresp:
+                            print(f"[BCN] {bresp}")
+            finally:
+                fc_ser.close()
     finally:
         node.close()
     return 0

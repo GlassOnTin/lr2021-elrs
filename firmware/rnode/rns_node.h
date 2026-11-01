@@ -167,7 +167,10 @@ typedef enum {
     RNS_DRONE_CMD_LOITER,
     RNS_DRONE_CMD_LAND,
     RNS_DRONE_CMD_GUIDED_GOTO,
-    RNS_DRONE_CMD_RC_OVERRIDE
+    RNS_DRONE_CMD_RC_OVERRIDE,
+    RNS_DRONE_CMD_SET_MODE,
+    RNS_DRONE_CMD_ARM,
+    RNS_DRONE_CMD_DISARM
 } rns_drone_cmd_type_t;
 
 typedef struct {
@@ -176,6 +179,7 @@ typedef struct {
     int32_t              lon_deg_e7;
     int32_t              alt_m;
     uint16_t             rc_us[4];
+    uint8_t              mode_num;
 } rns_drone_cmd_t;
 
 /* Lightweight streaming MAVLink v1/v2 parser state */

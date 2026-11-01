@@ -385,7 +385,33 @@ static void test_fc_mavlink_and_beacons(void) {
     size_t mlen = rns_build_mavlink_command(&parsed, 7U, mav_frame, sizeof(mav_frame));
     assert(mlen == 49U); /* 10B header + 37B MISSION_ITEM_INT + 2B CRC */
     assert(mav_frame[0] == 0xFDU && mav_frame[1] == 37U && mav_frame[7] == 73U);
-    printf("[PASS] test_fc_mavlink_and_beacons (rnlog.beacon, elrs.drone.cmd, MAVLink v2 MISSION_ITEM_INT)\n");
+
+    /* Verify MODE 5 -> COMMAND_LONG (76) MAV_CMD_DO_SET_MODE (176) */
+    clen = rns_build_drone_command_pkt("MODE 5", cmd_pkt, sizeof(cmd_pkt));
+    assert(rns_parse_drone_command_pkt(cmd_pkt, clen, &parsed));
+    assert(parsed.type == RNS_DRONE_CMD_SET_MODE && parsed.mode_num == 5U);
+    mlen = rns_build_mavlink_command(&parsed, 8U, mav_frame, sizeof(mav_frame));
+    assert(mlen == 45U && mav_frame[0] == 0xFDU && mav_frame[1] == 33U && mav_frame[7] == 76U);
+
+    /* Verify ARM / DISARM -> COMMAND_LONG (76) MAV_CMD_COMPONENT_ARM_DISARM (400) */
+    clen = rns_build_drone_command_pkt("ARM", cmd_pkt, sizeof(cmd_pkt));
+    assert(rns_parse_drone_command_pkt(cmd_pkt, clen, &parsed));
+    assert(parsed.type == RNS_DRONE_CMD_ARM);
+    mlen = rns_build_mavlink_command(&parsed, 9U, mav_frame, sizeof(mav_frame));
+    assert(mlen == 45U && mav_frame[7] == 76U);
+
+    clen = rns_build_drone_command_pkt("DISARM", cmd_pkt, sizeof(cmd_pkt));
+    assert(rns_parse_drone_command_pkt(cmd_pkt, clen, &parsed));
+    assert(parsed.type == RNS_DRONE_CMD_DISARM);
+
+    /* Verify RC 1600 1400 1100 1500 -> RC_CHANNELS_OVERRIDE (70, 30B frame) */
+    clen = rns_build_drone_command_pkt("RC 1600 1400 1100 1500", cmd_pkt, sizeof(cmd_pkt));
+    assert(rns_parse_drone_command_pkt(cmd_pkt, clen, &parsed));
+    assert(parsed.type == RNS_DRONE_CMD_RC_OVERRIDE);
+    assert(parsed.rc_us[0] == 1600U && parsed.rc_us[1] == 1400U && parsed.rc_us[2] == 1100U && parsed.rc_us[3] == 1500U);
+    mlen = rns_build_mavlink_command(&parsed, 10U, mav_frame, sizeof(mav_frame));
+    assert(mlen == 30U && mav_frame[0] == 0xFDU && mav_frame[1] == 18U && mav_frame[7] == 70U);
+    printf("[PASS] test_fc_mavlink_and_beacons (rnlog.beacon, elrs.drone.cmd, MAVLink v2 MISSION_ITEM_INT/COMMAND_LONG/RC_OVERRIDE)\n");
 }
 
 static void test_elrs_data_tunnel(void) {

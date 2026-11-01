@@ -1192,7 +1192,9 @@ static void inspect_and_act_on_rns_packet(const uint8_t *pkt, uint16_t len, cons
         uint16_t pay_len = (uint16_t)(len - RNS_MIN_PACKET_LEN);
         if (dcmd.type == RNS_DRONE_CMD_RC_OVERRIDE) {
             for (int i = 0; i < 4; i++) {
-                g_rc_channels[i] = crsf_us_to_ticks(dcmd.rc_us[i]);
+                if (dcmd.rc_us[i] >= 800U) {
+                    g_rc_channels[i] = crsf_us_to_ticks(dcmd.rc_us[i]);
+                }
             }
         }
         uint8_t mav_frame[64];
@@ -1243,6 +1245,7 @@ static void handle_cli_command(char *line) {
             "  rns_cmd <GOTO lat lon alt|RTL|LAND|ARM|DISARM|MODE n|RC c1 c2 c3 c4> - Send RNS drone cmd\r\n"
             "  rns_tx <hex_bytes>             - Send raw Reticulum packet over Relay LoRa or ELRS tunnel\r\n"
             "  fc_sim <lat_e7> <lon_e7> <alt_m> <vbatt_mv> - Set simulated FC telemetry for beacons\r\n"
+            "  mav_rx <hex_bytes>             - Feed raw MAVLink v1/v2 frame into FC telemetry parser\r\n"
             "  rc <ch1_us> [ch2_us .. ch16_us]- Set RC channels in us (988..2012)\r\n"
             "  ping <freq_hz> <lora|flrc> [n] - Transmit n ping packets and await PONG\r\n"
             "  pong <freq_hz> <lora|flrc>     - Listen on freq_hz and auto-reply PONG\r\n"
@@ -1445,6 +1448,29 @@ static void handle_cli_command(char *line) {
         hal_usb_uart_printf("OK fc_sim lat=%ld lon=%ld alt_mm=%ld vbatt=%umV\r\n",
                             (long)g_fc_tlm.lat_deg_e7, (long)g_fc_tlm.lon_deg_e7,
                             (long)g_fc_tlm.rel_alt_mm, (unsigned)g_fc_tlm.vbatt_mv);
+        return;
+    }
+
+    if (strcmp(cmd, "mav_rx") == 0) {
+        char *hex = strtok(NULL, " ");
+        if (hex == NULL) {
+            hal_usb_uart_puts("ERR: usage: mav_rx <hex_bytes>\r\n");
+            return;
+        }
+        size_t slen = strlen(hex);
+        for (size_t i = 0U; i + 1U < slen; i += 2U) {
+            char pair[3] = {hex[i], hex[i + 1U], '\0'};
+            uint8_t b = (uint8_t)strtoul(pair, NULL, 16);
+            (void)rns_mav_parse_byte(&g_mav_parser, b, &g_fc_tlm);
+        }
+        hal_usb_uart_printf("OK MAV_RX pkts=%lu mode=%u armed=%u vbatt=%umV lat=%ld lon=%ld alt_mm=%ld\r\n",
+                            (unsigned long)g_fc_tlm.rx_mav_pkts,
+                            (unsigned)g_fc_tlm.custom_mode,
+                            g_fc_tlm.armed ? 1U : 0U,
+                            (unsigned)g_fc_tlm.vbatt_mv,
+                            (long)g_fc_tlm.lat_deg_e7,
+                            (long)g_fc_tlm.lon_deg_e7,
+                            (long)g_fc_tlm.rel_alt_mm);
         return;
     }
 

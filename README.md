@@ -112,10 +112,12 @@ Configure the airborne EVK (`/dev/ttyACM7`) as a store-and-forward Reticulum rel
 ./tools/lr2021_cli.py -p /dev/ttyACM7 configure --mode relay
 # Optional: broadcast a Reticulum GPS/battery telemetry beacon every 5 seconds
 ./tools/lr2021_cli.py -p /dev/ttyACM7 rns-beacon --interval-ms 5000
+# Bridge live MAVLink v2 telemetry & commands with an ArduPilot flight controller
+./tools/lr2021_cli.py -p /dev/ttyACM7 fc-bridge --fc-port /dev/ttyACM4
 ```
 
 ### 2. Reticulum-over-ExpressLRS FHSS Tunnel (`ELRS_TX` ↔ `ELRS_RX`)
-Send Reticulum drone commands (`GOTO`, `RTL`, `LOITER`, `LAND`, `ARM`, `DISARM`) and receive `rnlog.beacon` telemetry beacons over an active 200 Hz (`EU868`) or 1000 Hz (`CE_LBT`) ExpressLRS FHSS link:
+Send Reticulum drone commands (`GOTO`, `RTL`, `LOITER`, `LAND`, `MODE`, `ARM`, `DISARM`, `RC`) and receive `rnlog.beacon` telemetry beacons over an active 200 Hz (`EU868`) or 1000 Hz (`CE_LBT`) ExpressLRS FHSS link:
 ```bash
 # Receiver on drone (Board 2)
 ./tools/lr2021_cli.py -p /dev/ttyACM7 configure --phrase "lr2021-elrs-demo" --domain eu868 --rate 900_200HZ --mode rx
@@ -156,6 +158,7 @@ mode <idle|tx|rx|monitor|bridge|rnode|relay> - Switch operating mode
 rnode_cfg <freq_hz> <bw_hz> <sf> <cr> - Configure RNode / Relay LoRa RF parameters
 bcn <now|interval_ms>                 - Send immediate Reticulum FC beacon or set periodic interval
 fc_sim <lat_e7> <lon_e7> <alt_m> <mv> - Set simulated FC telemetry state for beacon testing
+mav_rx <hex_bytes>                    - Feed raw MAVLink v1/v2 frame into FC telemetry parser
 rns_cmd <GOTO lat lon alt|RTL|LAND..> - Send Reticulum drone command over LoRa or ELRS tunnel
 rns_tx <hex_bytes>                    - Send or tunnel raw Reticulum packet bytes
 rc <ch1_us> [ch2_us..ch16_us]         - Set uplink RC channel values in microseconds (988..2012)
@@ -169,23 +172,23 @@ scan <900|2400>                       - Sweep RSSI across Sub-GHz or 2.4 GHz ban
 
 ## Measured Hardware Verification
 
-Tested on two `LR2021EVK1XBS1_XIAO` boards (`FC6D1A37` and `D56B6941`) and a live **RadioMaster TX16SMK3 ↔ RadioMaster XR4 (`2× LR1121`)** ExpressLRS link (`lr2021-elrs-demo`, `UID = 0A:B7:0C:7C:38:03`):
+Tested on two `LR2021EVK1XBS1_XIAO` boards (`FC6D1A37` and `D56B6941`), a live **ArduPilot `TMotorH743` flight controller** (`/dev/ttyACM4`), and a live **RadioMaster TX16SMK3 ↔ RadioMaster XR4 (`2× LR1121`)** ExpressLRS link (`lr2021-elrs-demo`, `UID = 0A:B7:0C:7C:38:03`):
 
-1. **Live 867.2 MHz UK Sub-GHz `RNODE` KISS TNC ↔ Airborne `RELAY` Mesh Repeater + MAVLink v2 Bridge:**
-   - Verified full RNode KISS handshake (`CMD_DETECT=0x46`, `CMD_STAT_PHYPRM=040003d00012001300020006`, `CMD_READY=0x01`), over-the-air `rnlog.beacon` JSON reception (`rssi=-95 dBm`, `snr=+14.25 dB`), unmasked Reticulum packet store-and-forward (`hops: 0 -> 1`), 64-entry FNV-1a duplicate suppression (`relay_drop=1`), byte-for-byte IFAC packet preservation (`ifac=1`), and over-the-air `elrs.drone.cmd` (`GOTO 0 0 85`) translation into a 49-byte MAVLink v2 `MISSION_ITEM_INT` frame:
+1. **Closed-Loop 867.2 MHz UK Sub-GHz `RNODE` KISS TNC ↔ Airborne `RELAY` ↔ Live `TMotorH743` Flight Controller:**
+   - Verified full RNode KISS handshake (`CMD_DETECT=0x46`, `CMD_STAT_PHYPRM=040003d00012001300020006`, `CMD_READY=0x01`), live `TMotorH743` MAVLink v2 `HEARTBEAT` (`#0`) + `SYS_STATUS` (`#1`, `16,019 mV` 4S LiPo) + `GLOBAL_POSITION_INT` (`#33`) ingestion, over-the-air `rnlog.beacon` JSON reception (`rssi=-95 dBm`, `snr=+14.25 dB`), unmasked Reticulum packet store-and-forward (`hops: 0 -> 1`), 64-entry FNV-1a duplicate suppression (`relay_drop=1`), byte-for-byte IFAC packet preservation (`ifac=1`), and closed-loop execution of `LOITER`, `RTL`, `LAND`, `MODE 2`, `GOTO 0 0 85`, `ARM`, `DISARM`, and `MODE 0` on the live `TMotorH743` (`COMMAND_ACK result=0`, `MISSION_ACK`, and `HEARTBEAT.custom_mode` transitions `0 -> 5 -> 6 -> 9 -> 2 -> 0`):
    ```text
-   RNS_CMD_RX src=LORA hops=0 cmd="GOTO 0 0 85" type=4 mav_len=49 mav_hex=FD25000000FFBE49000000000000000000000000000000000000D067B31E7181ECFF0000AA42000010000101060201E970
-   RNS_RELAY_RX len=36 rssi=-95dBm snr=14dB hops=0 ifac=0 fwd=1
-   RNS_RELAY_FWD len=36 hops=1
-   RNS rnode_freq=867200000 bw=125000 sf=7 cr=4/5 online=1 relay_fwd=3 relay_drop=1 tun_tx=0 tun_rx=0 fc_pkts=0 fc_drop=0
+   [RELAY] RNS_CMD_RX src=LORA hops=0 cmd="LOITER" type=2 mav_len=45 mav_hex=FD21000000FFBE4C00000000000000000000000000000000000000000000000000000000000011000101008AB3
+   [TMotorH743 COMMAND_ACK] COMMAND_ACK {command : 17, result : 0, progress : 0, result_param2 : 0, target_system : 255, target_component : 190}
+   [TMotorH743 HEARTBEAT] HEARTBEAT {type : 2, autopilot : 3, base_mode : 89, custom_mode : 5, system_status : 3, mavlink_version : 3}
+   [RELAY BCN] OK RNS_BCN_TX sent=1 len=136 json={"src":"lr2021-drone","lat":0.00000,"lon":0.00000,"alt_m":-1,"vbatt_mv":16011,"mode":5,"armed":0,"lq":100,"rssi":-95}
    ```
-2. **Live Bidirectional Reticulum-over-ExpressLRS FHSS Tunnel (`ELRS_PKT_TYPE_DATA` on `EU868 900_200HZ` and `CE_LBT 2G4_K1000`):**
-   - Verified 100% fragmentation and reassembly of both uplink `elrs.drone.cmd` (`GOTO` / `RTL`) and 140-byte downlink `rnlog.beacon` Reticulum packets across `OTA4` (`8 B`) frames on `EU868 900_200HZ` and `CE_LBT 2G4_K1000` (`2,882 / 2,883 = 99.97%` uplink CRC, `988 / 988 = 100%` downlink telemetry CRC):
+2. **Closed-Loop Bidirectional Reticulum-over-ExpressLRS FHSS Tunnel (`ELRS_PKT_TYPE_DATA` on `EU868 900_200HZ` and `CE_LBT 2G4_K1000`) ↔ Live `TMotorH743`:**
+   - Verified 100% fragmentation and reassembly of both uplink `elrs.drone.cmd` (`MODE 5`, `RTL`, `LAND`, `GOTO 0 0 85`, `RC 1620 1380 1050 1510`, `RC 0 0 0 0`, `MODE 0`) and 135-byte downlink `rnlog.beacon` Reticulum packets across `OTA4` (`8 B`) frames on `EU868 900_200HZ` and `CE_LBT 2G4_K1000` (`2,882 / 2,883 = 99.97%` uplink CRC, `988 / 988 = 100%` downlink telemetry CRC), including live `RC_CHANNELS_OVERRIDE` (`#70`) and `COMMAND_ACK` (`result=0`) on `TMotorH743`:
    ```text
-   ELRS_RNS_RX len=45 hops=0 hex=0800734547DB63023618AE2BD9A65187BAFC00474F544F203531353037343030...
-   RNS_CMD_RX src=ELRS_TUNNEL hops=0 cmd="GOTO 0 0 85" type=4 mav_len=49 mav_hex=FD25000000FFBE49000000000000000000000000000000000000D067B31E7181ECFF0000AA42000010000101060201E970
-   ELRS_RNS_RX len=140 hops=0 hex=080018BCD8A3DEA16EF6765C6B27D008D220007B22737263223A226C72323032...
-   RNS_BCN_RX src=ELRS_TUNNEL hops=0 len=140 json={"src":"lr2021-drone","lat":0.00000,"lon":0.00000,"alt_m":120,"vbatt_mv":24800,"mode":0,"armed":0,"lq":100,"rssi":-100}
+   ELRS_RNS_RX len=135 hops=0 hex=080018BCD8A3DEA16EF6765C6B27D008D220007B22737263223A226C72323032...
+   RNS_BCN_RX src=ELRS_TUNNEL hops=0 len=135 json={"src":"lr2021-drone","lat":0.00000,"lon":0.00000,"alt_m":0,"vbatt_mv":16018,"mode":6,"armed":0,"lq":100,"rssi":-95}
+   RNS_CMD_RX src=ELRS_TUNNEL hops=0 cmd="RC 1620 1380 1050 1510" type=5 mav_len=30 mav_hex=FD12000003FFBE460000540664051A04E60500000000000000000101BA5A
+   [TMotorH743 RC_CHANNELS] ch1=1620 ch2=1380 ch3=1050 ch4=1510 rssi=255
    ```
 3. **Live 2.4 GHz `2G4_K1000` (`CE_LBT`, 80 channels, 1000 Hz GFSK + Hamming FEC, 1:2 telemetry) Passive `MONITOR` (`TX16SMK3` ↔ `XR4`):**
    - Captures 500 Hz TX16SMK3 uplink (`SYNC` + `RCDATA`) and 500 Hz XR4 downlink (`LINKSTATS` + CRSF telemetry `DATA` frames) simultaneously (`1,789 / 1,842 = 97.1%` combined packet CRC rate over `2.0 s`, `phase_err = 4 us`).
