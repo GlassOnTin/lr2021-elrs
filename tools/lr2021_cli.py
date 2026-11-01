@@ -4,6 +4,7 @@
 """Host CLI and bench control utility for Seeed Wio-LR2021 + XIAO nRF54L15 ELRS nodes."""
 
 import argparse
+import subprocess
 import sys
 import time
 
@@ -124,6 +125,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_relay.add_argument("--off-time", type=float, default=1.5, help="Off duration in seconds for cycle")
 
+    p_hub = sub.add_parser("hub", help="Control MEGA4 PPPS USB hub ports via uhubctl")
+    p_hub.add_argument("--location", default="3-1", help="USB hub location (default: 3-1)")
+    p_hub.add_argument("--hub-port", type=int, help="Hub port number (1=Drone, 2=D56B6941, 3=FC6D1A37)")
+    p_hub.add_argument(
+        "--action",
+        choices=["status", "on", "off", "cycle"],
+        default="status",
+        help="Port power action",
+    )
+
     return parser
 
 
@@ -135,6 +146,16 @@ def main() -> int:
         out = control_sh_ur04a_relay(args.relay_port, args.ch, args.state, args.off_time)
         print(out)
         return 0
+
+    if args.subcmd == "hub":
+        cmd = ["uhubctl", "-l", args.location]
+        if args.hub_port is not None:
+            cmd.extend(["-p", str(args.hub_port)])
+        if args.action != "status":
+            cmd.extend(["-a", args.action])
+        res = subprocess.run(cmd, check=False, capture_output=True, text=True)
+        print((res.stdout + res.stderr).strip())
+        return res.returncode
 
     node = LR2021Node(args.port, args.baud)
     try:

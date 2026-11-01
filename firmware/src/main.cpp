@@ -489,7 +489,12 @@ static void radio_rx_done_isr(const uint8_t *payload, uint8_t len, const lr2021_
                     elrs_ota_validate_crc(&g_ota, g_prev_sync_ch_pkt, prev_n)) {
                     g_ota.ota_nonce       = (uint8_t)n;
                     g_ota.switch_mode     = ELRS_SW_HYBRID_OR_16CH;
-                    g_tlm_denom           = 2U;
+                    if ((g_prev_sync_ch_pkt[0] & 0x03U) == ELRS_PKT_TYPE_DATA ||
+                        ((g_prev_sync_ch_pkt[1] & 0x7FU) == 0x00U &&
+                         g_prev_sync_ch_pkt[5] == 0x00U &&
+                         g_prev_sync_ch_pkt[6] == 0x00U)) {
+                        g_tlm_denom = 2U;
+                    }
                     elrs_fhss_set_index(&g_fhss, 0U);
                     g_lock_state          = LOCK_TENTATIVE;
                     g_rf_Consec_good      = 1U;
@@ -515,7 +520,7 @@ static void radio_rx_done_isr(const uint8_t *payload, uint8_t len, const lr2021_
         bool valid = false;
         if (!g_ota.is_full_res && (g_ota.ota_nonce & 1U) == 0U &&
             pkt_type == ELRS_PKT_TYPE_LINKSTATS &&
-            payload[1] == 0x00U && payload[6] == 0x00U &&
+            (payload[1] & 0x7FU) == 0x00U && payload[5] == 0x00U && payload[6] == 0x00U &&
             elrs_ota_validate_crc(&g_ota, payload, g_ota.ota_nonce)) {
             g_tlm_denom = 2U;
         }
