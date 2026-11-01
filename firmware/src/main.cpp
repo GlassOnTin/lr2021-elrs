@@ -139,6 +139,61 @@ static rns_mav_parser_t     g_mav_parser;
 static rns_fc_telemetry_t   g_fc_tlm;
 static elrs_data_tunnel_t   g_elrs_tunnel;
 static uint8_t              g_mav_tx_seq = 0U;
+static rns_node_identity_t  g_rns_id;
+static rns_peer_table_t     g_rns_peers;
+static uint8_t              g_rns_cmd_seq = 1U;
+
+static void format_hex_bytes(const uint8_t *in, size_t len, char *out) {
+    static const char hex[] = "0123456789abcdef";
+    for (size_t i = 0U; i < len; i++) {
+        out[i * 2U]      = hex[(in[i] >> 4U) & 0x0FU];
+        out[i * 2U + 1U] = hex[in[i] & 0x0FU];
+    }
+    out[len * 2U] = '\0';
+}
+
+static bool parse_hex_bytes(const char *str, uint8_t *out, size_t expected_bytes) {
+    if (str == NULL || out == NULL) {
+        return false;
+    }
+    size_t slen = strlen(str);
+    if (slen != expected_bytes * 2U) {
+        return false;
+    }
+    for (size_t i = 0U; i < expected_bytes; i++) {
+        char pair[3] = {str[i * 2U], str[i * 2U + 1U], '\0'};
+        char *endp = NULL;
+        unsigned long val = strtoul(pair, &endp, 16);
+        if (endp == NULL || *endp != '\0') {
+            return false;
+        }
+        out[i] = (uint8_t)val;
+    }
+    return true;
+}
+
+static void refresh_rns_identity(void) {
+    uint8_t hw_id[8];
+    hal_get_device_id(hw_id);
+    bool prev_ifac = g_rns_id.ifac_enabled;
+    char prev_pass[16];
+    memcpy(prev_pass, g_rns_id.ifac_pass, sizeof(prev_pass));
+
+    uint8_t role     = RNS_NODE_ROLE_RX;
+    const char *name = "LR2021-RX";
+    if (g_app_mode == APP_MODE_ELRS_TX) {
+        role = RNS_NODE_ROLE_TX;
+        name = "LR2021-TX";
+    } else if (g_app_mode == APP_MODE_RELAY) {
+        role = RNS_NODE_ROLE_RELAY;
+        name = "LR2021-RLY";
+    } else if (g_app_mode == APP_MODE_RNODE) {
+        role = RNS_NODE_ROLE_RNODE;
+        name = "LR2021-RND";
+    }
+    rns_identity_init(&g_rns_id, hw_id, g_ota.uid, role, name);
+    rns_identity_set_ifac(&g_rns_id, prev_ifac, prev_pass);
+}
 
 static volatile bool        g_rns_rx_flag = false;
 static uint8_t              g_rns_rx_buf[RNODE_LORA_MAX_PKT];
@@ -1049,6 +1104,7 @@ static void start_mode(app_mode_t new_mode) {
     g_rns_rx_flag         = false;
     g_relay_pending       = false;
     hal_led_set(false);
+    refresh_rns_identity();
 
     if (new_mode == APP_MODE_IDLE) {
         hal_usb_uart_printf("[MODE] Switched to IDLE (STDBY_XOSC)\r\n");
@@ -1199,6 +1255,15 @@ static void print_status(void) {
         (unsigned long)g_fc_tlm.rx_mav_pkts,
         (unsigned long)g_fc_tlm.rx_mav_Drop
     );
+    char dest_hex[33], id_hex[33];
+    format_hex_bytes(g_rns_id.dest_hash, 16U, dest_hex);
+    format_hex_bytes(g_rns_id.identity_hash, 16U, id_hex);
+    hal_usb_uart_printf("RNS_ID dest=%s id=%s role=%u name=\"%s\" ifac=%u peers=%u sel=%d rtt_ms=%u\r\n",
+                        dest_hex, id_hex, (unsigned)g_rns_id.role, g_rns_id.name,
+                        g_rns_id.ifac_enabled ? 1U : 0U,
+                        (unsigned)g_rns_peers.count,
+                        (int)g_rns_peers.selected_idx,
+                        (unsigned)g_rns_peers.last_ping_rtt_ms);
 }
 
 static bool send_or_tunnel_rns_packet(const uint8_t *pkt, uint16_t len) {
@@ -1221,12 +1286,185 @@ static bool send_or_tunnel_rns_packet(const uint8_t *pkt, uint16_t len) {
     return false;
 }
 
+static bool send_rns_node_announce(void) {
+    uint8_t pkt[RNODE_LORA_MAX_PKT];
+    size_t alen = rns_build_node_announce(&g_rns_id,
+                                          g_rnode_cfg.frequency_hz,
+                                          g_rnode_cfg.bandwidth_hz,
+                                          g_rnode_cfg.sf,
+                                          g_rnode_cfg.cr,
+                                          &g_fc_tlm,
+                                          pkt,
+                                          sizeof(pkt));
+    if (alen == 0U) {
+        return false;
+    }
+    return send_or_tunnel_rns_packet(pkt, (uint16_t)alen);
+}
+
+static bool send_rns_pairing_sync(void) {
+    rns_pairing_cfg_t pcfg;
+    memset(&pcfg, 0, sizeof(pcfg));
+    memcpy(pcfg.tx_dest, g_rns_id.dest_hash, 16U);
+    pcfg.freq_hz      = g_rnode_cfg.frequency_hz;
+    pcfg.bw_hz        = g_rnode_cfg.bandwidth_hz;
+    pcfg.sf           = g_rnode_cfg.sf;
+    pcfg.cr           = g_rnode_cfg.cr;
+    pcfg.txpower_dbm  = g_rnode_cfg.txpower_dbm;
+    pcfg.ifac_enabled = g_rns_id.ifac_enabled;
+    memcpy(pcfg.ifac_pass, g_rns_id.ifac_pass, sizeof(pcfg.ifac_pass));
+
+    uint8_t pkt[RNODE_LORA_MAX_PKT];
+    size_t plen = rns_build_pairing_pkt(&pcfg, pkt, sizeof(pkt));
+    if (plen == 0U) {
+        return false;
+    }
+    return send_or_tunnel_rns_packet(pkt, (uint16_t)plen);
+}
+
+static bool send_rns_targeted_cmd(const uint8_t target_dest[16], const char *cmd_str, uint8_t seq) {
+    uint8_t pkt[RNODE_LORA_MAX_PKT];
+    size_t clen = rns_build_targeted_cmd_pkt(target_dest, g_rns_id.dest_hash, seq, cmd_str, pkt, sizeof(pkt));
+    if (clen == 0U) {
+        return false;
+    }
+    if (strcmp(cmd_str, "PING") == 0 || strncmp(cmd_str, "ACK:", 4) != 0) {
+        g_rns_peers.last_ping_seq   = seq;
+        g_rns_peers.last_ping_tx_ms = hal_millis();
+    }
+    return send_or_tunnel_rns_packet(pkt, (uint16_t)clen);
+}
+
 static void inspect_and_act_on_rns_packet(const uint8_t *pkt, uint16_t len, const char *src_tag) {
     if (pkt == NULL || len <= RNS_MIN_PACKET_LEN) {
         return;
     }
     bool ifac = (pkt[0] & 0x80U) != 0U;
     uint8_t hops = pkt[1];
+
+    /* 0a. Check if Reticulum Node Announce (RNSA / 0x01) */
+    if (rns_parse_node_announce(pkt, len, g_last_rssi_dbm, (int8_t)(g_last_snr_q2 / 4),
+                                hal_millis(), &g_rns_peers)) {
+        int peer_idx = 0;
+        for (uint8_t i = 0U; i < g_rns_peers.count; i++) {
+            if (memcmp(g_rns_peers.peers[i].dest_hash, &pkt[2], 16U) == 0) {
+                peer_idx = (int)i;
+                break;
+            }
+        }
+        const rns_peer_entry_t *pe = &g_rns_peers.peers[peer_idx];
+        char dhex[33];
+        format_hex_bytes(pe->dest_hash, 16U, dhex);
+        hal_usb_uart_printf("RNS_PEER_ANNOUNCE src=%s idx=%d dest=%s role=%u hops=%u name=\"%s\" vbatt=%umV mode=%u\r\n",
+                            src_tag, peer_idx, dhex, (unsigned)pe->role, (unsigned)pe->hops,
+                            pe->name, (unsigned)pe->vbatt_mv, (unsigned)pe->custom_mode);
+        return;
+    }
+
+    /* 0b. Check if Over-the-Air Reticulum Pairing & Config Sync (RNSP) */
+    rns_pairing_cfg_t pcfg;
+    if (rns_parse_pairing_pkt(pkt, len, g_rns_id.dest_hash, &pcfg)) {
+        g_rnode_cfg.frequency_hz = pcfg.freq_hz;
+        g_rnode_cfg.bandwidth_hz = pcfg.bw_hz;
+        g_rnode_cfg.sf           = pcfg.sf;
+        g_rnode_cfg.cr           = pcfg.cr;
+        g_rnode_cfg.txpower_dbm  = pcfg.txpower_dbm;
+        rns_identity_set_ifac(&g_rns_id, pcfg.ifac_enabled, pcfg.ifac_pass);
+        if (g_app_mode == APP_MODE_RNODE || g_app_mode == APP_MODE_RELAY) {
+            configure_radio_for_rnode();
+        }
+        /* Record TX peer in peer table and immediately reply with our node announce */
+        uint8_t fake_ann[68];
+        rns_node_identity_t tx_id;
+        memset(&tx_id, 0, sizeof(tx_id));
+        memcpy(tx_id.dest_hash, pcfg.tx_dest, 16U);
+        tx_id.role = RNS_NODE_ROLE_TX;
+        strncpy(tx_id.name, "LR2021-TX", sizeof(tx_id.name) - 1U);
+        rns_fc_telemetry_t zero_tlm;
+        memset(&zero_tlm, 0, sizeof(zero_tlm));
+        size_t alen = rns_build_node_announce(&tx_id,
+                                              pcfg.freq_hz,
+                                              pcfg.bw_hz,
+                                              pcfg.sf,
+                                              pcfg.cr,
+                                              &zero_tlm,
+                                              fake_ann,
+                                              sizeof(fake_ann));
+        if (alen > 0U) {
+            fake_ann[1] = hops;
+            (void)rns_parse_node_announce(fake_ann, alen, g_last_rssi_dbm, (int8_t)(g_last_snr_q2 / 4),
+                                          hal_millis(), &g_rns_peers);
+        }
+        char tx_hex[33], my_hex[33];
+        format_hex_bytes(pcfg.tx_dest, 16U, tx_hex);
+        format_hex_bytes(g_rns_id.dest_hash, 16U, my_hex);
+        bool ann_sent = send_rns_node_announce();
+        hal_usb_uart_printf("RNS_PAIRED src=%s tx_dest=%s rx_dest=%s freq=%lu bw=%lu sf=%u cr=4/%u pwr=%ddBm ifac=%u reply_ann=%u\r\n",
+                            src_tag, tx_hex, my_hex,
+                            (unsigned long)g_rnode_cfg.frequency_hz,
+                            (unsigned long)g_rnode_cfg.bandwidth_hz,
+                            (unsigned)g_rnode_cfg.sf,
+                            (unsigned)g_rnode_cfg.cr,
+                            (int)g_rnode_cfg.txpower_dbm,
+                            g_rns_id.ifac_enabled ? 1U : 0U,
+                            ann_sent ? 1U : 0U);
+        return;
+    }
+
+    /* 0c. Check if Targeted Reticulum Command / Ping / Pong (RNSC context 0xA6) */
+    uint8_t sender_dest[16];
+    uint8_t cmd_seq = 0U;
+    char cmd_str[64];
+    if (rns_parse_targeted_cmd_pkt(pkt, len, g_rns_id.dest_hash, sender_dest, &cmd_seq, cmd_str, sizeof(cmd_str))) {
+        char sender_hex[33];
+        format_hex_bytes(sender_dest, 16U, sender_hex);
+        if (strcmp(cmd_str, "PING") == 0) {
+            bool pong_ok = send_rns_targeted_cmd(sender_dest, "PONG", cmd_seq);
+            hal_usb_uart_printf("RNS_PING_RX src=%s from=%s hops=%u seq=%u pong_sent=%u\r\n",
+                                src_tag, sender_hex, hops, cmd_seq, pong_ok ? 1U : 0U);
+            return;
+        }
+        if (strcmp(cmd_str, "PONG") == 0) {
+            uint32_t dt = hal_millis() - g_rns_peers.last_ping_tx_ms;
+            g_rns_peers.last_ping_rtt_ms = (dt == 0U) ? 1U : (dt > 65535U ? 65535U : (uint16_t)dt);
+            hal_usb_uart_printf("RNS_PONG_RX src=%s from=%s hops=%u seq=%u rtt_ms=%u\r\n",
+                                src_tag, sender_hex, hops, cmd_seq, (unsigned)g_rns_peers.last_ping_rtt_ms);
+            return;
+        }
+        if (strncmp(cmd_str, "ACK:", 4) == 0) {
+            uint32_t dt = hal_millis() - g_rns_peers.last_ping_tx_ms;
+            g_rns_peers.last_ping_rtt_ms = (dt == 0U) ? 1U : (dt > 65535U ? 65535U : (uint16_t)dt);
+            hal_usb_uart_printf("RNS_CMD_ACK_RX src=%s from=%s hops=%u seq=%u rtt_ms=%u ack=\"%s\"\r\n",
+                                src_tag, sender_hex, hops, cmd_seq, (unsigned)g_rns_peers.last_ping_rtt_ms, cmd_str);
+            return;
+        }
+
+        /* Targeted drone command addressed specifically to our 16-byte dest_hash */
+        uint8_t tmp_pkt[128];
+        size_t tlen = rns_build_drone_command_pkt(cmd_str, tmp_pkt, sizeof(tmp_pkt));
+        rns_drone_cmd_t tdcmd;
+        if (tlen > 0U && rns_parse_drone_command_pkt(tmp_pkt, tlen, &tdcmd)) {
+            if (tdcmd.type == RNS_DRONE_CMD_RC_OVERRIDE) {
+                for (int i = 0; i < 4; i++) {
+                    if (tdcmd.rc_us[i] >= 800U) {
+                        g_rc_channels[i] = crsf_us_to_ticks(tdcmd.rc_us[i]);
+                    }
+                }
+            }
+            uint8_t mav_frame[64];
+            size_t mav_len = rns_build_mavlink_command(&tdcmd, g_mav_tx_seq++, mav_frame, sizeof(mav_frame));
+            if (mav_len > 0U) {
+                hal_crsf_uart_write(mav_frame, mav_len);
+            }
+            char ack_msg[48];
+            snprintf(ack_msg, sizeof(ack_msg), "ACK:%s", cmd_str);
+            bool ack_sent = send_rns_targeted_cmd(sender_dest, ack_msg, cmd_seq);
+            hal_usb_uart_printf("RNS_TARGETED_CMD_RX src=%s from=%s hops=%u seq=%u cmd=\"%s\" type=%u mav_len=%u ack=%u\r\n",
+                                src_tag, sender_hex, hops, cmd_seq, cmd_str,
+                                (unsigned)tdcmd.type, (unsigned)mav_len, ack_sent ? 1U : 0U);
+            return;
+        }
+    }
 
     /* 1. Check if addressed to "rnlog.beacon" */
     if (!ifac && memcmp(&pkt[2], RNS_DEST_RNLOG_BEACON, 16U) == 0) {
@@ -1262,6 +1500,146 @@ static void inspect_and_act_on_rns_packet(const uint8_t *pkt, uint16_t len, cons
     }
 }
 
+static size_t process_crsf_rns_frame(const uint8_t *frame, uint8_t frame_len, uint8_t out_resp[64]) {
+    if (frame == NULL || frame_len < 4U || out_resp == NULL) {
+        return 0U;
+    }
+    uint8_t ftype = frame[2];
+    if (ftype == CRSF_FRAMETYPE_DEVICE_PING) {
+        uint8_t hw_id[8];
+        hal_get_device_id(hw_id);
+        uint32_t serial = ((uint32_t)hw_id[0] << 24U) |
+                          ((uint32_t)hw_id[1] << 16U) |
+                          ((uint32_t)hw_id[2] << 8U)  |
+                          (uint32_t)hw_id[3];
+        return crsf_build_device_info_frame("LR2021 RNS-ELRS", serial, out_resp);
+    }
+
+    if (ftype != CRSF_FRAMETYPE_RNS_CMD || frame_len < 7U) {
+        return 0U;
+    }
+
+    uint8_t subcmd = frame[5];
+    switch (subcmd) {
+        case CRSF_RNS_SUBCMD_GET_STATUS: {
+            crsf_rns_status_t st;
+            memset(&st, 0, sizeof(st));
+            st.app_mode         = (uint8_t)g_app_mode;
+            st.lock_state       = (uint8_t)g_lock_state;
+            st.elrs_rate_idx    = g_rate_idx;
+            st.rnode_txpower    = g_rnode_cfg.txpower_dbm;
+            st.rnode_freq_hz    = g_rnode_cfg.frequency_hz;
+            st.rnode_bw_khz     = (uint16_t)(g_rnode_cfg.bandwidth_hz / 1000UL);
+            st.rnode_sf         = g_rnode_cfg.sf;
+            st.rnode_cr         = g_rnode_cfg.cr;
+            st.ifac_enabled     = g_rns_id.ifac_enabled;
+            st.peer_count       = g_rns_peers.count;
+            st.selected_peer    = (uint8_t)g_rns_peers.selected_idx;
+            st.last_ping_rtt_ms = g_rns_peers.last_ping_rtt_ms;
+            st.tx_msgs          = (uint16_t)(g_elrs_tunnel.tx_msgs_sent & 0xFFFFU);
+            st.rx_msgs          = (uint16_t)(g_elrs_tunnel.rx_msgs_completed & 0xFFFFU);
+            st.relayed_msgs     = (uint16_t)(g_rns_relay.relayed_count & 0xFFFFU);
+            memcpy(st.tx_dest, g_rns_id.dest_hash, 16U);
+            if (g_rns_peers.selected_idx >= 0 && g_rns_peers.selected_idx < (int8_t)g_rns_peers.count) {
+                memcpy(st.rx_dest, g_rns_peers.peers[g_rns_peers.selected_idx].dest_hash, 16U);
+            }
+            return crsf_build_rns_status_frame(&st, out_resp);
+        }
+
+        case CRSF_RNS_SUBCMD_GET_PEER: {
+            uint8_t idx = (frame_len >= 8U) ? frame[6] : 0U;
+            crsf_rns_peer_info_t pi;
+            memset(&pi, 0, sizeof(pi));
+            pi.peer_idx    = idx;
+            pi.total_peers = g_rns_peers.count;
+            pi.is_selected = (g_rns_peers.selected_idx == (int8_t)idx);
+            if (idx < g_rns_peers.count && g_rns_peers.peers[idx].valid) {
+                const rns_peer_entry_t *pe = &g_rns_peers.peers[idx];
+                pi.role        = pe->role;
+                pi.hops        = pe->hops;
+                pi.rssi_dbm    = pe->rssi_dbm;
+                pi.snr_db      = pe->snr_db;
+                pi.armed       = pe->armed;
+                pi.custom_mode = pe->custom_mode;
+                pi.vbatt_mv    = pe->vbatt_mv;
+                uint32_t dt_s  = (hal_millis() - pe->last_seen_ms) / 1000U;
+                pi.age_s       = (dt_s > 65535U) ? 65535U : (uint16_t)dt_s;
+                memcpy(pi.dest_hash, pe->dest_hash, 16U);
+                memcpy(pi.name, pe->name, 12U);
+            }
+            return crsf_build_rns_peer_frame(&pi, out_resp);
+        }
+
+        case CRSF_RNS_SUBCMD_SET_CFG: {
+            /* Payload: [freq_be(4), bw_be(4), sf(1), cr(1), txpwr(1), ifac_en(1)] */
+            if (frame_len >= 19U) {
+                const uint8_t *p = &frame[6];
+                g_rnode_cfg.frequency_hz = ((uint32_t)p[0] << 24U) |
+                                           ((uint32_t)p[1] << 16U) |
+                                           ((uint32_t)p[2] << 8U)  |
+                                           (uint32_t)p[3];
+                g_rnode_cfg.bandwidth_hz = ((uint32_t)p[4] << 24U) |
+                                           ((uint32_t)p[5] << 16U) |
+                                           ((uint32_t)p[6] << 8U)  |
+                                           (uint32_t)p[7];
+                g_rnode_cfg.sf           = p[8];
+                g_rnode_cfg.cr           = p[9];
+                g_rnode_cfg.txpower_dbm  = (int8_t)p[10];
+                bool ifac_en             = (p[11] != 0U);
+                rns_identity_set_ifac(&g_rns_id, ifac_en, g_rns_id.ifac_pass[0] ? g_rns_id.ifac_pass : "elrs-mesh");
+                if (g_app_mode == APP_MODE_RNODE || g_app_mode == APP_MODE_RELAY) {
+                    configure_radio_for_rnode();
+                }
+                return crsf_build_rns_ack_frame(subcmd, 0U, out_resp);
+            }
+            return crsf_build_rns_ack_frame(subcmd, 1U, out_resp);
+        }
+
+        case CRSF_RNS_SUBCMD_PAIR_RX: {
+            bool ok = send_rns_pairing_sync();
+            return crsf_build_rns_ack_frame(subcmd, ok ? 0U : 1U, out_resp);
+        }
+
+        case CRSF_RNS_SUBCMD_SELECT_PEER: {
+            if (frame_len >= 8U) {
+                int8_t sel = (int8_t)frame[6];
+                if (sel >= 0 && sel < (int8_t)g_rns_peers.count) {
+                    g_rns_peers.selected_idx = sel;
+                    return crsf_build_rns_ack_frame(subcmd, 0U, out_resp);
+                }
+            }
+            return crsf_build_rns_ack_frame(subcmd, 1U, out_resp);
+        }
+
+        case CRSF_RNS_SUBCMD_ACTION: {
+            uint8_t act = (frame_len >= 8U) ? frame[6] : 0U;
+            if (act == CRSF_RNS_ACT_ANNOUNCE) {
+                bool ok = send_rns_node_announce();
+                return crsf_build_rns_ack_frame(subcmd, ok ? 0U : 1U, out_resp);
+            }
+            const uint8_t *target_dest = RNS_DEST_DRONE_CMD;
+            if (g_rns_peers.selected_idx >= 0 && g_rns_peers.selected_idx < (int8_t)g_rns_peers.count) {
+                target_dest = g_rns_peers.peers[g_rns_peers.selected_idx].dest_hash;
+            }
+            const char *cstr = NULL;
+            if (act == CRSF_RNS_ACT_PING)         cstr = "PING";
+            else if (act == CRSF_RNS_ACT_LOITER)  cstr = "LOITER";
+            else if (act == CRSF_RNS_ACT_RTL)     cstr = "RTL";
+            else if (act == CRSF_RNS_ACT_LAND)    cstr = "LAND";
+            else if (act == CRSF_RNS_ACT_ARM)     cstr = "ARM";
+            else if (act == CRSF_RNS_ACT_DISARM)  cstr = "DISARM";
+            if (cstr != NULL) {
+                bool ok = send_rns_targeted_cmd(target_dest, cstr, g_rns_cmd_seq++);
+                return crsf_build_rns_ack_frame(subcmd, ok ? 0U : 1U, out_resp);
+            }
+            return crsf_build_rns_ack_frame(subcmd, 1U, out_resp);
+        }
+
+        default:
+            return crsf_build_rns_ack_frame(subcmd, 1U, out_resp);
+    }
+}
+
 static void handle_cli_command(char *line) {
     while (*line && isspace((unsigned char)*line)) {
         line++;
@@ -1292,6 +1670,12 @@ static void handle_cli_command(char *line) {
             "  mode <idle|tx|rx|monitor|bridge|rnode|relay> - Switch operating mode\r\n"
             "  rnode_cfg [freq] [bw] [sf] [cr]- Set RNode/Relay LoRa config (e.g. 868000000 125000 7 5)\r\n"
             "  bcn [now | <interval_ms>]      - Send Reticulum rnlog.beacon now or set periodic ms\r\n"
+            "  rns_id                         - Show this node's 16-byte Reticulum SINGLE address & ID\r\n"
+            "  rns_ann                        - Broadcast signed Reticulum node announce (RNSA)\r\n"
+            "  rns_pair [ifac_pass]           - OTA sync Reticulum RF/IFAC config & pair bound RX (RNSP)\r\n"
+            "  rns_peers [select <idx>]       - List discovered Reticulum peers or select target RX\r\n"
+            "  rns_to <dest|sel> <cmd>        - Send command/PING to specific 16B Reticulum RX address\r\n"
+            "  crsf_lua <status|peer|ann|pair|ping|loiter|rtl> - Test EdgeTX Lua CRSF 0x7A/0x7B bridge\r\n"
             "  rns_cmd <GOTO lat lon alt|RTL|LAND|ARM|DISARM|MODE n|RC c1 c2 c3 c4> - Send RNS drone cmd\r\n"
             "  rns_tx <hex_bytes>             - Send raw Reticulum packet over Relay LoRa or ELRS tunnel\r\n"
             "  fc_sim <lat_e7> <lon_e7> <alt_m> <vbatt_mv> - Set simulated FC telemetry for beacons\r\n"
@@ -1333,6 +1717,7 @@ static void handle_cli_command(char *line) {
         const elrs_air_rate_config_t *r = elrs_get_air_rate_by_index(g_rate_idx);
         elrs_ota_init(&g_ota, new_uid, r ? r->payload_len : 8U, g_ota.switch_mode);
         elrs_fhss_init(&g_fhss, g_domain, g_ota.uid_seed);
+        refresh_rns_identity();
         hal_usb_uart_printf("OK phrase=\"%s\" -> UID=%02X:%02X:%02X:%02X:%02X:%02X seed=0x%08lX crc_init=0x%04X sync_freq=%lu Hz\r\n",
                             rest,
                             g_ota.uid[0], g_ota.uid[1], g_ota.uid[2],
@@ -1356,6 +1741,7 @@ static void handle_cli_command(char *line) {
         const elrs_air_rate_config_t *r = elrs_get_air_rate_by_index(g_rate_idx);
         elrs_ota_init(&g_ota, new_uid, r ? r->payload_len : 8U, g_ota.switch_mode);
         elrs_fhss_init(&g_fhss, g_domain, g_ota.uid_seed);
+        refresh_rns_identity();
         hal_usb_uart_printf("OK UID=%02X:%02X:%02X:%02X:%02X:%02X seed=0x%08lX crc_init=0x%04X sync_freq=%lu Hz\r\n",
                             g_ota.uid[0], g_ota.uid[1], g_ota.uid[2],
                             g_ota.uid[3], g_ota.uid[4], g_ota.uid[5],
@@ -1540,6 +1926,190 @@ static void handle_cli_command(char *line) {
         g_beacon_interval_ms = (uint32_t)strtoul(arg, NULL, 10);
         g_last_beacon_ms     = hal_millis();
         hal_usb_uart_printf("OK bcn interval=%lu ms\r\n", (unsigned long)g_beacon_interval_ms);
+        return;
+    }
+
+    if (strcmp(cmd, "rns_id") == 0) {
+        uint8_t hw_id[8];
+        hal_get_device_id(hw_id);
+        char hw_hex[17], dest_hex[33], id_hex[33], sel_hex[33] = "none";
+        format_hex_bytes(hw_id, 8U, hw_hex);
+        format_hex_bytes(g_rns_id.dest_hash, 16U, dest_hex);
+        format_hex_bytes(g_rns_id.identity_hash, 16U, id_hex);
+        if (g_rns_peers.selected_idx >= 0 && g_rns_peers.selected_idx < (int8_t)g_rns_peers.count) {
+            format_hex_bytes(g_rns_peers.peers[g_rns_peers.selected_idx].dest_hash, 16U, sel_hex);
+        }
+        hal_usb_uart_printf("OK RNS_IDENTITY hw_id=%s dest=%s id=%s role=%u name=\"%s\" ifac=%u peers=%u sel_rx=%s\r\n",
+                            hw_hex, dest_hex, id_hex, (unsigned)g_rns_id.role, g_rns_id.name,
+                            g_rns_id.ifac_enabled ? 1U : 0U,
+                            (unsigned)g_rns_peers.count, sel_hex);
+        return;
+    }
+
+    if (strcmp(cmd, "rns_ann") == 0) {
+        bool ok = send_rns_node_announce();
+        char dest_hex[33];
+        format_hex_bytes(g_rns_id.dest_hash, 16U, dest_hex);
+        hal_usb_uart_printf("OK RNS_ANNOUNCE_TX sent=%u dest=%s role=%u name=\"%s\"\r\n",
+                            ok ? 1U : 0U, dest_hex, (unsigned)g_rns_id.role, g_rns_id.name);
+        return;
+    }
+
+    if (strcmp(cmd, "rns_pair") == 0) {
+        char *pass = strtok(NULL, " ");
+        if (pass != NULL) {
+            if (strcasecmp(pass, "off") == 0 || strcasecmp(pass, "none") == 0) {
+                rns_identity_set_ifac(&g_rns_id, false, NULL);
+            } else {
+                rns_identity_set_ifac(&g_rns_id, true, pass);
+            }
+        }
+        bool ok = send_rns_pairing_sync();
+        char tx_hex[33];
+        format_hex_bytes(g_rns_id.dest_hash, 16U, tx_hex);
+        hal_usb_uart_printf("OK RNS_PAIR_TX sent=%u tx_dest=%s freq=%lu bw=%lu sf=%u cr=4/%u pwr=%ddBm ifac=%u\r\n",
+                            ok ? 1U : 0U, tx_hex,
+                            (unsigned long)g_rnode_cfg.frequency_hz,
+                            (unsigned long)g_rnode_cfg.bandwidth_hz,
+                            (unsigned)g_rnode_cfg.sf,
+                            (unsigned)g_rnode_cfg.cr,
+                            (int)g_rnode_cfg.txpower_dbm,
+                            g_rns_id.ifac_enabled ? 1U : 0U);
+        return;
+    }
+
+    if (strcmp(cmd, "rns_peers") == 0) {
+        char *sub = strtok(NULL, " ");
+        if (sub != NULL && (strcasecmp(sub, "select") == 0 || strcasecmp(sub, "sel") == 0)) {
+            char *idx_s = strtok(NULL, " ");
+            if (idx_s == NULL) {
+                hal_usb_uart_puts("ERR: usage: rns_peers select <idx>\r\n");
+                return;
+            }
+            int idx = (int)strtol(idx_s, NULL, 10);
+            if (idx >= 0 && idx < (int)g_rns_peers.count && g_rns_peers.peers[idx].valid) {
+                g_rns_peers.selected_idx = (int8_t)idx;
+                char dhex[33];
+                format_hex_bytes(g_rns_peers.peers[idx].dest_hash, 16U, dhex);
+                hal_usb_uart_printf("OK RNS_PEER_SEL idx=%d dest=%s name=\"%s\"\r\n",
+                                    idx, dhex, g_rns_peers.peers[idx].name);
+            } else {
+                hal_usb_uart_printf("ERR: invalid peer idx %d (count=%u)\r\n", idx, (unsigned)g_rns_peers.count);
+            }
+            return;
+        }
+        hal_usb_uart_printf("RNS_PEERS count=%u selected=%d last_rtt_ms=%u\r\n",
+                            (unsigned)g_rns_peers.count,
+                            (int)g_rns_peers.selected_idx,
+                            (unsigned)g_rns_peers.last_ping_rtt_ms);
+        uint32_t now_ms = hal_millis();
+        for (uint8_t i = 0U; i < g_rns_peers.count; i++) {
+            const rns_peer_entry_t *pe = &g_rns_peers.peers[i];
+            if (!pe->valid) continue;
+            char dhex[33];
+            format_hex_bytes(pe->dest_hash, 16U, dhex);
+            uint32_t age_ms = now_ms - pe->last_seen_ms;
+            hal_usb_uart_printf("  [%u]%s dest=%s role=%u hops=%u rssi=%ddBm snr=%ddB vbatt=%umV mode=%u age=%lums name=\"%s\"\r\n",
+                                (unsigned)i,
+                                (g_rns_peers.selected_idx == (int8_t)i) ? "*" : " ",
+                                dhex, (unsigned)pe->role, (unsigned)pe->hops,
+                                (int)pe->rssi_dbm, (int)pe->snr_db,
+                                (unsigned)pe->vbatt_mv, (unsigned)pe->custom_mode,
+                                (unsigned long)age_ms, pe->name);
+        }
+        return;
+    }
+
+    if (strcmp(cmd, "rns_to") == 0) {
+        char *dest_arg = strtok(NULL, " ");
+        char *rest     = strtok(NULL, "");
+        if (dest_arg == NULL || rest == NULL) {
+            hal_usb_uart_puts("ERR: usage: rns_to <32_hex_dest | sel | bcast> <PING | LOITER | RTL | LAND | ARM | DISARM | MODE n | GOTO ...>\r\n");
+            return;
+        }
+        while (*rest && isspace((unsigned char)*rest)) rest++;
+        uint8_t target_dest[16];
+        if (strcasecmp(dest_arg, "sel") == 0) {
+            if (g_rns_peers.selected_idx < 0 || g_rns_peers.selected_idx >= (int8_t)g_rns_peers.count) {
+                hal_usb_uart_puts("ERR: no selected peer in table\r\n");
+                return;
+            }
+            memcpy(target_dest, g_rns_peers.peers[g_rns_peers.selected_idx].dest_hash, 16U);
+        } else if (strcasecmp(dest_arg, "bcast") == 0) {
+            memcpy(target_dest, RNS_DEST_DRONE_CMD, 16U);
+        } else if (!parse_hex_bytes(dest_arg, target_dest, 16U)) {
+            hal_usb_uart_puts("ERR: destination must be 32 hex chars (16 bytes), 'sel', or 'bcast'\r\n");
+            return;
+        }
+        uint8_t seq = g_rns_cmd_seq++;
+        bool ok = send_rns_targeted_cmd(target_dest, rest, seq);
+        char dhex[33];
+        format_hex_bytes(target_dest, 16U, dhex);
+        hal_usb_uart_printf("OK RNS_TO_TX sent=%u to=%s seq=%u cmd=\"%s\"\r\n",
+                            ok ? 1U : 0U, dhex, (unsigned)seq, rest);
+        return;
+    }
+
+    if (strcmp(cmd, "crsf_lua") == 0) {
+        char *sub = strtok(NULL, " ");
+        if (sub == NULL) {
+            hal_usb_uart_puts("ERR: usage: crsf_lua <status|peer [idx]|ann|pair|ping|loiter|rtl>\r\n");
+            return;
+        }
+        uint8_t req[32];
+        size_t req_len = 0U;
+        if (strcasecmp(sub, "status") == 0) {
+            req_len = crsf_build_rns_cmd_frame(CRSF_RNS_SUBCMD_GET_STATUS, NULL, 0U, req);
+        } else if (strcasecmp(sub, "peer") == 0) {
+            char *idx_s = strtok(NULL, " ");
+            uint8_t idx = idx_s ? (uint8_t)strtoul(idx_s, NULL, 10) : 0U;
+            req_len = crsf_build_rns_cmd_frame(CRSF_RNS_SUBCMD_GET_PEER, &idx, 1U, req);
+        } else if (strcasecmp(sub, "pair") == 0) {
+            req_len = crsf_build_rns_cmd_frame(CRSF_RNS_SUBCMD_PAIR_RX, NULL, 0U, req);
+        } else {
+            uint8_t act = 0U;
+            if (strcasecmp(sub, "ann") == 0)         act = CRSF_RNS_ACT_ANNOUNCE;
+            else if (strcasecmp(sub, "ping") == 0)   act = CRSF_RNS_ACT_PING;
+            else if (strcasecmp(sub, "loiter") == 0) act = CRSF_RNS_ACT_LOITER;
+            else if (strcasecmp(sub, "rtl") == 0)    act = CRSF_RNS_ACT_RTL;
+            else if (strcasecmp(sub, "land") == 0)   act = CRSF_RNS_ACT_LAND;
+            else if (strcasecmp(sub, "arm") == 0)    act = CRSF_RNS_ACT_ARM;
+            else if (strcasecmp(sub, "disarm") == 0) act = CRSF_RNS_ACT_DISARM;
+            if (act != 0U) {
+                req_len = crsf_build_rns_cmd_frame(CRSF_RNS_SUBCMD_ACTION, &act, 1U, req);
+            }
+        }
+        uint8_t resp[64];
+        size_t resp_len = process_crsf_rns_frame(req, (uint8_t)req_len, resp);
+        if (resp_len == 0U) {
+            hal_usb_uart_puts("ERR: crsf_lua failed\r\n");
+            return;
+        }
+        if (resp[5] == CRSF_RNS_RESP_STATUS) {
+            crsf_rns_status_t st;
+            if (crsf_decode_rns_status_frame(resp, resp_len, &st)) {
+                char txh[33], rxh[33];
+                format_hex_bytes(st.tx_dest, 16U, txh);
+                format_hex_bytes(st.rx_dest, 16U, rxh);
+                hal_usb_uart_printf("OK CRSF_LUA_STATUS len=%u mode=%u lock=%u freq=%lu bw_khz=%u sf=%u cr=4/%u peers=%u rtt=%ums tx_dest=%s rx_dest=%s\r\n",
+                                    (unsigned)resp_len, st.app_mode, st.lock_state,
+                                    (unsigned long)st.rnode_freq_hz, (unsigned)st.rnode_bw_khz,
+                                    st.rnode_sf, st.rnode_cr, st.peer_count, st.last_ping_rtt_ms,
+                                    txh, rxh);
+            }
+        } else if (resp[5] == CRSF_RNS_RESP_PEER) {
+            crsf_rns_peer_info_t pi;
+            if (crsf_decode_rns_peer_frame(resp, resp_len, &pi)) {
+                char dh[33];
+                format_hex_bytes(pi.dest_hash, 16U, dh);
+                hal_usb_uart_printf("OK CRSF_LUA_PEER len=%u idx=%u/%u role=%u hops=%u rssi=%ddBm snr=%ddB vbatt=%umV dest=%s name=\"%s\"\r\n",
+                                    (unsigned)resp_len, pi.peer_idx, pi.total_peers, pi.role, pi.hops,
+                                    (int)pi.rssi_dbm, (int)pi.snr_db, (unsigned)pi.vbatt_mv, dh, pi.name);
+            }
+        } else if (resp[5] == CRSF_RNS_RESP_ACK) {
+            hal_usb_uart_printf("OK CRSF_LUA_ACK len=%u subcmd=0x%02X status=%u\r\n",
+                                (unsigned)resp_len, resp[6], resp[7]);
+        }
         return;
     }
 
@@ -1770,6 +2340,7 @@ int main(void) {
     crsf_parser_init(&g_crsf_parser);
     rnode_kiss_init(&g_kiss_parser, on_rnode_kiss_frame, NULL);
     rns_relay_init(&g_rns_relay);
+    rns_peer_table_init(&g_rns_peers);
     rns_mav_parser_init(&g_mav_parser);
     memset(&g_fc_tlm, 0, sizeof(g_fc_tlm));
     g_fc_tlm.vbatt_mv = 24800U; /* Default 6S nominal until MAVLink SYS_STATUS arrives */
@@ -1780,6 +2351,8 @@ int main(void) {
     elrs_uid_from_bind_phrase("lr2021-elrs-demo", default_uid);
     elrs_ota_init(&g_ota, default_uid, ELRS_OTA4_PACKET_SIZE, ELRS_SW_WIDE_OR_8CH);
     elrs_fhss_init(&g_fhss, g_domain, g_ota.uid_seed);
+    memset(&g_rns_id, 0, sizeof(g_rns_id));
+    refresh_rns_identity();
 
     lr2021_set_callbacks(radio_rx_done_isr, radio_tx_done_isr);
 
@@ -1787,6 +2360,8 @@ int main(void) {
     bool radio_ok = lr2021_begin(868000000UL, 2440000000UL, &chip_ver);
     g_chip_version = chip_ver;
 
+    char boot_dest[33];
+    format_hex_bytes(g_rns_id.dest_hash, 16U, boot_dest);
     hal_usb_uart_printf("\r\n========================================================\r\n");
     hal_usb_uart_printf("LR2021-ELRS + Reticulum RNode/Relay Firmware (nRF54L15)\r\n");
     hal_usb_uart_printf("LR2021 Init: %s (Version=0x%04X, Errors=0x%04X)\r\n",
@@ -1794,6 +2369,7 @@ int main(void) {
     hal_usb_uart_printf("Default UID: %02X:%02X:%02X:%02X:%02X:%02X (phrase=\"lr2021-elrs-demo\")\r\n",
                         g_ota.uid[0], g_ota.uid[1], g_ota.uid[2],
                         g_ota.uid[3], g_ota.uid[4], g_ota.uid[5]);
+    hal_usb_uart_printf("Reticulum SINGLE Dest: %s\r\n", boot_dest);
     hal_usb_uart_printf("========================================================\r\n");
 
     char cli_buf[192];
@@ -1836,6 +2412,12 @@ int main(void) {
                 if (ftype == CRSF_FRAMETYPE_RC_CHANNELS) {
                     (void)crsf_decode_rc_channels_frame(g_crsf_parser.buf, flen, g_rc_channels);
                     g_rc_is_armed = (g_rc_channels[4] > ELRS_CRSF_CH_MID);
+                } else if (ftype == CRSF_FRAMETYPE_DEVICE_PING || ftype == CRSF_FRAMETYPE_RNS_CMD) {
+                    uint8_t resp[64];
+                    size_t rlen = process_crsf_rns_frame(g_crsf_parser.buf, flen, resp);
+                    if (rlen > 0U) {
+                        hal_crsf_uart_write(resp, rlen);
+                    }
                 }
             }
             (void)rns_mav_parse_byte(&g_mav_parser, ub, &g_fc_tlm);

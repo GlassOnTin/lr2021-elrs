@@ -485,6 +485,164 @@ static void test_elrs_data_tunnel(void) {
     printf("[PASS] test_elrs_data_tunnel (OTA8 13B + OTA4 8B fragmentation/reassembly with loss recovery)\n");
 }
 
+static void test_rns_identity_pairing_and_lua_crsf(void) {
+    /* 1. Verify FIPS 180-4 SHA-256 test vector ("abc") */
+    const uint8_t abc[3] = {'a', 'b', 'c'};
+    const uint8_t expected_abc_sha[32] = {
+        0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea,
+        0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
+        0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c,
+        0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad
+    };
+    uint8_t sha[32] = {0};
+    rns_sha256(abc, 3U, sha);
+    assert(memcmp(sha, expected_abc_sha, 32U) == 0);
+
+    /* 2. Verify two hardware boards with identical ELRS binding UID derive distinct 16B Reticulum SINGLE addresses */
+    uint8_t uid[6];
+    elrs_uid_from_bind_phrase("lr2021-elrs-demo", uid);
+    const uint8_t hw_board1[8] = {0xFC, 0x6D, 0x1A, 0x37, 0x11, 0x22, 0x33, 0x44};
+    const uint8_t hw_board2[8] = {0xD5, 0x6B, 0x69, 0x41, 0x55, 0x66, 0x77, 0x88};
+
+    rns_node_identity_t tx_id, rx_id;
+    rns_identity_init(&tx_id, hw_board1, uid, RNS_NODE_ROLE_TX, "LR2021-TX");
+    rns_identity_init(&rx_id, hw_board2, uid, RNS_NODE_ROLE_RX, "LR2021-RX");
+    assert(memcmp(tx_id.dest_hash, rx_id.dest_hash, 16U) != 0);
+    assert(memcmp(tx_id.identity_hash, rx_id.identity_hash, 16U) != 0);
+
+    /* Verify determinism: re-running with same hw_id + uid produces identical dest_hash */
+    rns_node_identity_t rx_id_again;
+    rns_identity_init(&rx_id_again, hw_board2, uid, RNS_NODE_ROLE_RX, "LR2021-RX");
+    assert(memcmp(rx_id.dest_hash, rx_id_again.dest_hash, 16U) == 0);
+
+    /* 3. Verify RNSA Node Announce & Peer Table auto-discovery */
+    rns_peer_table_t tx_peers;
+    rns_peer_table_init(&tx_peers);
+    assert(tx_peers.count == 0U && tx_peers.selected_idx == -1);
+
+    rns_fc_telemetry_t rx_tlm = {};
+    rx_tlm.vbatt_mv    = 25100U;
+    rx_tlm.custom_mode = 5U; /* Loiter */
+    rx_tlm.armed       = true;
+
+    uint8_t ann_pkt[128];
+    size_t ann_len = rns_build_node_announce(&rx_id, 868000000UL, 125000UL, 7U, 5U, &rx_tlm, ann_pkt, sizeof(ann_pkt));
+    assert(ann_len == 68U);
+    assert(ann_pkt[0] == 0x01U); /* HEADER_1, SINGLE, ANNOUNCE */
+
+    assert(rns_parse_node_announce(ann_pkt, ann_len, -42, 11, 5000UL, &tx_peers));
+    assert(tx_peers.count == 1U);
+    assert(tx_peers.selected_idx == 0); /* Automatically selected first RX peer */
+    assert(memcmp(tx_peers.peers[0].dest_hash, rx_id.dest_hash, 16U) == 0);
+    assert(tx_peers.peers[0].role == RNS_NODE_ROLE_RX);
+    assert(tx_peers.peers[0].vbatt_mv == 25100U);
+    assert(tx_peers.peers[0].custom_mode == 5U);
+    assert(strcmp(tx_peers.peers[0].name, "LR2021-RX") == 0);
+
+    /* Tampered announce authenticator must be rejected */
+    ann_pkt[ann_len - 1U] ^= 0xFFU;
+    assert(!rns_parse_node_announce(ann_pkt, ann_len, -42, 11, 5100UL, &tx_peers));
+
+    /* 4. Verify Over-the-Air Reticulum Pairing & Config Sync (RNSP) */
+    rns_pairing_cfg_t p_in = {};
+    memcpy(p_in.tx_dest, tx_id.dest_hash, 16U);
+    p_in.freq_hz      = 869525000UL;
+    p_in.bw_hz        = 250000UL;
+    p_in.sf           = 8U;
+    p_in.cr           = 6U;
+    p_in.txpower_dbm  = 14;
+    p_in.ifac_enabled = true;
+    strcpy(p_in.ifac_pass, "mesh-key-42");
+
+    uint8_t pair_pkt[128];
+    size_t pair_len = rns_build_pairing_pkt(&p_in, pair_pkt, sizeof(pair_pkt));
+    assert(pair_len == 68U);
+
+    rns_pairing_cfg_t p_out = {};
+    assert(rns_parse_pairing_pkt(pair_pkt, pair_len, rx_id.dest_hash, &p_out));
+    assert(memcmp(p_out.tx_dest, tx_id.dest_hash, 16U) == 0);
+    assert(p_out.freq_hz == 869525000UL);
+    assert(p_out.bw_hz == 250000UL);
+    assert(p_out.sf == 8U && p_out.cr == 6U && p_out.txpower_dbm == 14);
+    assert(p_out.ifac_enabled && strcmp(p_out.ifac_pass, "mesh-key-42") == 0);
+
+    /* Tampered pairing authenticator must be rejected */
+    pair_pkt[pair_len - 1U] ^= 0xFFU;
+    assert(!rns_parse_pairing_pkt(pair_pkt, pair_len, rx_id.dest_hash, &p_out));
+
+    /* 5. Verify Targeted Receiver Command (RNSC) addressed to RX's 16-byte dest_hash */
+    uint8_t tcmd_pkt[128];
+    size_t tcmd_len = rns_build_targeted_cmd_pkt(rx_id.dest_hash, tx_id.dest_hash, 42U, "LOITER", tcmd_pkt, sizeof(tcmd_pkt));
+    assert(tcmd_len > 40U);
+
+    uint8_t sender_dest[16] = {0};
+    uint8_t rx_seq = 0U;
+    char rx_cmd[32] = {0};
+    /* Another node (e.g., TX itself) must NOT accept a command addressed to rx_id.dest_hash */
+    assert(!rns_parse_targeted_cmd_pkt(tcmd_pkt, tcmd_len, tx_id.dest_hash, sender_dest, &rx_seq, rx_cmd, sizeof(rx_cmd)));
+    /* The targeted RX node MUST accept it and recover sender_dest == tx_id.dest_hash */
+    assert(rns_parse_targeted_cmd_pkt(tcmd_pkt, tcmd_len, rx_id.dest_hash, sender_dest, &rx_seq, rx_cmd, sizeof(rx_cmd)));
+    assert(memcmp(sender_dest, tx_id.dest_hash, 16U) == 0);
+    assert(rx_seq == 42U);
+    assert(strcmp(rx_cmd, "LOITER") == 0);
+
+    /* 6. Verify CRSF 0x7A/0x7B EdgeTX Lua telemetry frames fit within 64B and round-trip */
+    crsf_rns_status_t st_in = {};
+    st_in.app_mode         = 2U;
+    st_in.lock_state       = 2U;
+    st_in.elrs_rate_idx    = 3U;
+    st_in.rnode_txpower    = 10;
+    st_in.rnode_freq_hz    = 868000000UL;
+    st_in.rnode_bw_khz     = 125U;
+    st_in.rnode_sf         = 7U;
+    st_in.rnode_cr         = 5U;
+    st_in.ifac_enabled     = true;
+    st_in.peer_count       = 1U;
+    st_in.selected_peer    = 0U;
+    st_in.last_ping_rtt_ms = 28U;
+    st_in.tx_msgs          = 12U;
+    st_in.rx_msgs          = 11U;
+    st_in.relayed_msgs     = 4U;
+    memcpy(st_in.tx_dest, tx_id.dest_hash, 16U);
+    memcpy(st_in.rx_dest, rx_id.dest_hash, 16U);
+
+    uint8_t crsf_buf[64] = {0};
+    size_t st_flen = crsf_build_rns_status_frame(&st_in, crsf_buf);
+    assert(st_flen == 62U && st_flen <= CRSF_MAX_FRAME_LEN);
+
+    crsf_rns_status_t st_out = {};
+    assert(crsf_decode_rns_status_frame(crsf_buf, st_flen, &st_out));
+    assert(st_out.rnode_freq_hz == 868000000UL && st_out.last_ping_rtt_ms == 28U);
+    assert(memcmp(st_out.tx_dest, tx_id.dest_hash, 16U) == 0);
+    assert(memcmp(st_out.rx_dest, rx_id.dest_hash, 16U) == 0);
+
+    crsf_rns_peer_info_t pi_in = {};
+    pi_in.peer_idx    = 0U;
+    pi_in.total_peers = 1U;
+    pi_in.is_selected = true;
+    pi_in.role        = RNS_NODE_ROLE_RX;
+    pi_in.hops        = 1U;
+    pi_in.rssi_dbm    = -45;
+    pi_in.snr_db      = 10;
+    pi_in.armed       = true;
+    pi_in.custom_mode = 5U;
+    pi_in.vbatt_mv    = 25100U;
+    pi_in.age_s       = 2U;
+    memcpy(pi_in.dest_hash, rx_id.dest_hash, 16U);
+    strcpy(pi_in.name, "LR2021-RX");
+
+    size_t pi_flen = crsf_build_rns_peer_frame(&pi_in, crsf_buf);
+    assert(pi_flen == 48U && pi_flen <= CRSF_MAX_FRAME_LEN);
+
+    crsf_rns_peer_info_t pi_out = {};
+    assert(crsf_decode_rns_peer_frame(crsf_buf, pi_flen, &pi_out));
+    assert(pi_out.vbatt_mv == 25100U && pi_out.hops == 1U && pi_out.rssi_dbm == -45);
+    assert(memcmp(pi_out.dest_hash, rx_id.dest_hash, 16U) == 0);
+    assert(strcmp(pi_out.name, "LR2021-RX") == 0);
+
+    printf("[PASS] test_rns_identity_pairing_and_lua_crsf (SHA-256, 16B SINGLE dest_hash, RNSA/RNSP/RNSC, CRSF 0x7A/0x7B)\n");
+}
+
 int main(void) {
     test_uid_md5();
     test_fhss_invariants();
@@ -495,6 +653,7 @@ int main(void) {
     test_rns_relay_dedup_and_ifac();
     test_fc_mavlink_and_beacons();
     test_elrs_data_tunnel();
+    test_rns_identity_pairing_and_lua_crsf();
     printf("All host unit tests PASSED.\n");
     return 0;
 }

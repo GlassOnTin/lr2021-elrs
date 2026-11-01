@@ -368,6 +368,19 @@ uint32_t hal_micros(void) {
     return NRF_TIMER10_S->CC[0];
 }
 
+void hal_get_device_id(uint8_t out_id[8]) {
+    uint32_t id0 = NRF_FICR_NS->INFO.DEVICEID[0];
+    uint32_t id1 = NRF_FICR_NS->INFO.DEVICEID[1];
+    out_id[0] = (uint8_t)(id0 & 0xFFU);
+    out_id[1] = (uint8_t)((id0 >> 8U) & 0xFFU);
+    out_id[2] = (uint8_t)((id0 >> 16U) & 0xFFU);
+    out_id[3] = (uint8_t)((id0 >> 24U) & 0xFFU);
+    out_id[4] = (uint8_t)(id1 & 0xFFU);
+    out_id[5] = (uint8_t)((id1 >> 8U) & 0xFFU);
+    out_id[6] = (uint8_t)((id1 >> 16U) & 0xFFU);
+    out_id[7] = (uint8_t)((id1 >> 24U) & 0xFFU);
+}
+
 uint32_t hal_millis(void) {
     return hal_micros() / 1000U;
 }

@@ -262,6 +262,131 @@ bool elrs_tunnel_process_rx_frame(elrs_data_tunnel_t *t,
                                   uint8_t *out_msg,
                                   uint16_t *out_msg_len);
 
+/* ---------------------------------------------------------------------------
+ * 5. Per-Node Reticulum Identity, Peer Table, OTA Pairing & Targeted Commands
+ * --------------------------------------------------------------------------- */
+#define RNS_MAX_PEERS           8U
+#define RNS_NODE_ROLE_IDLE      0U
+#define RNS_NODE_ROLE_TX        1U
+#define RNS_NODE_ROLE_RX        2U
+#define RNS_NODE_ROLE_RELAY     3U
+#define RNS_NODE_ROLE_RNODE     4U
+
+typedef struct {
+    uint8_t  hw_device_id[8];
+    uint8_t  elrs_uid[6];
+    uint8_t  pub_key[64];       /* 32B X25519 + 32B Ed25519 public identity material */
+    uint8_t  identity_hash[16]; /* SHA256(pub_key)[:16] */
+    uint8_t  dest_hash[16];     /* SHA256(SHA256("elrs.rns.node")[:10] || identity_hash)[:16] */
+    uint8_t  role;
+    char     name[16];
+    bool     ifac_enabled;
+    char     ifac_pass[16];
+    uint8_t  ifac_key[16];
+} rns_node_identity_t;
+
+typedef struct {
+    bool     valid;
+    uint8_t  dest_hash[16];
+    uint8_t  identity_hash[16];
+    uint8_t  role;
+    char     name[16];
+    uint8_t  hops;
+    int8_t   rssi_dbm;
+    int8_t   snr_db;
+    uint32_t freq_hz;
+    uint32_t bw_hz;
+    uint8_t  sf;
+    uint8_t  cr;
+    uint16_t vbatt_mv;
+    uint8_t  custom_mode;
+    bool     armed;
+    uint32_t last_seen_ms;
+} rns_peer_entry_t;
+
+typedef struct {
+    rns_peer_entry_t peers[RNS_MAX_PEERS];
+    uint8_t          count;
+    int8_t           selected_idx; /* -1 if none selected, otherwise 0..count-1 */
+    uint16_t         last_ping_rtt_ms;
+    uint8_t          last_ping_seq;
+    uint32_t         last_ping_tx_ms;
+} rns_peer_table_t;
+
+typedef struct {
+    uint8_t  target_dest[16]; /* All-zeros = broadcast to bound ELRS receiver */
+    uint8_t  tx_dest[16];     /* Pairing transmitter's 16B Reticulum dest_hash */
+    uint32_t freq_hz;
+    uint32_t bw_hz;
+    uint8_t  sf;
+    uint8_t  cr;
+    int8_t   txpower_dbm;
+    bool     ifac_enabled;
+    char     ifac_pass[16];
+} rns_pairing_cfg_t;
+
+/* Standalone SHA-256 (FIPS 180-4) */
+void rns_sha256(const uint8_t *data, size_t len, uint8_t out_hash[32]);
+
+/* Derive deterministic 64B node identity & 16B Reticulum SINGLE destination hash */
+void rns_identity_init(rns_node_identity_t *id,
+                       const uint8_t hw_device_id[8],
+                       const uint8_t elrs_uid[6],
+                       uint8_t role,
+                       const char *name);
+
+/* Configure IFAC network passphrase on the local identity */
+void rns_identity_set_ifac(rns_node_identity_t *id, bool enabled, const char *passphrase);
+
+/* Initialize peer table */
+void rns_peer_table_init(rns_peer_table_t *pt);
+
+/* Build a Reticulum ANNOUNCE / Node discovery packet (HEADER_1 | ANNOUNCE = 0x01) */
+size_t rns_build_node_announce(const rns_node_identity_t *id,
+                               uint32_t freq_hz,
+                               uint32_t bw_hz,
+                               uint8_t sf,
+                               uint8_t cr,
+                               const rns_fc_telemetry_t *tlm,
+                               uint8_t *out_pkt,
+                               size_t max_len);
+
+/* Parse an incoming Reticulum ANNOUNCE packet and insert/update in `pt` */
+bool rns_parse_node_announce(const uint8_t *pkt,
+                             size_t len,
+                             int8_t rssi_dbm,
+                             int8_t snr_db,
+                             uint32_t now_ms,
+                             rns_peer_table_t *pt);
+
+/* Build an Over-the-Air Reticulum Pairing & Config sync packet */
+size_t rns_build_pairing_pkt(const rns_pairing_cfg_t *cfg,
+                             uint8_t *out_pkt,
+                             size_t max_len);
+
+/* Parse an incoming Reticulum Pairing packet; returns true if addressed to `local_dest` or broadcast */
+bool rns_parse_pairing_pkt(const uint8_t *pkt,
+                           size_t len,
+                           const uint8_t local_dest[16],
+                           rns_pairing_cfg_t *out_cfg);
+
+/* Build a targeted Reticulum DATA packet addressed directly to a receiver's 16B `dest_hash` */
+size_t rns_build_targeted_cmd_pkt(const uint8_t target_dest[16],
+                                  const uint8_t sender_dest[16],
+                                  uint8_t seq,
+                                  const char *cmd_str,
+                                  uint8_t *out_pkt,
+                                  size_t max_len);
+
+/* Parse a targeted Reticulum DATA packet addressed to `local_dest` (or broadcast all-zeros) */
+bool rns_parse_targeted_cmd_pkt(const uint8_t *pkt,
+                                size_t len,
+                                const uint8_t local_dest[16],
+                                uint8_t out_sender_dest[16],
+                                uint8_t *out_seq,
+                                char *out_cmd_str,
+                                size_t max_cmd_str);
+
 #ifdef __cplusplus
 }
 #endif

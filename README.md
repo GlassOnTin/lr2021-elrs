@@ -10,6 +10,7 @@ Bare-metal ExpressLRS v3/v4 transceiver (`ELRS_TX`, `ELRS_RX`), passive over-the
   - **Airborne Reticulum Store-and-Forward Repeater (`RELAY` mode):** Receives variable-length explicit-header LoRa packets up to 255 bytes on 863–868 MHz (or 2.4 GHz), deduplicates via a 64-entry FNV-1a invariant packet-hash ring with a 10 s window, increments `hops` (`pkt[1]`) on unmasked packets, and preserves exact bytes on IFAC-authenticated packets (`pkt[0] & 0x80`).
   - **Flight Controller MAVLink v2 Bridge (`TMotorH743` / ArduPilot):** Parses incoming MAVLink v1/v2 `HEARTBEAT`, `SYS_STATUS`, and `GLOBAL_POSITION_INT` telemetry on the Grove UART (`D6`/`D7`) into Reticulum `rnlog.beacon` JSON broadcasts, and translates incoming Reticulum `elrs.drone.cmd` packets (`GOTO <lat_e7> <lon_e7> <alt_m>`, `RTL`, `LOITER`, `LAND`, `ARM`, `DISARM`, `MODE <n>`, `RC <c1..c4>`) into MAVLink v2 `MISSION_ITEM_INT` (`#73`) and `COMMAND_LONG` (`#76`) frames sent to the flight controller.
   - **Reticulum-over-ExpressLRS FHSS Tunnel (`ELRS_PKT_TYPE_DATA`):** Fragments and reassembles Reticulum packets up to 500 bytes across `OTA4` (8-byte, 5 B/fragment) and `OTA8` (13-byte, 10 B/fragment) ExpressLRS `DATA` (`0x01`) frames with configurable fragment redundancy (`repeats=2`), multiplexing mesh traffic alongside live 200 Hz / 1000 Hz RC control and `LINKSTATS` telemetry.
+  - **Per-Node 16-Byte Reticulum `SINGLE` Identity, OTA Pairing (`RNSP`) & EdgeTX Lua Script (`tools/rns_elrs.lua`):** Every TX, RX, Relay, and RNode derives a unique, deterministic 16-byte Reticulum `SINGLE` destination hash (`SHA256(SHA256("elrs.rns.node")[:10] || identity_hash)[:16]`) from its factory `NRF_FICR_NS->INFO.DEVICEID[0..1]` and ExpressLRS binding UID. Supports one-button Over-the-Air Reticulum pairing (`RNSP`), signed node announces (`RNSA`), targeted receiver commands & RTT pings (`RNSC`), and handset configuration via `tools/rns_elrs.lua` over CRSF extended frames (`0x7A` / `0x7B`).
 - **23 ExpressLRS Air Rates:**
   - **2.4 GHz GFSK + Hamming(7,4) FEC:** `2G4_K1000` (1000 Hz, 300 kbps, 8B->14B FEC), `2G4_DK500`, `2G4_DK250`
   - **2.4 GHz FLRC:** `2G4_F1000` (1000 Hz, 650 kbps), `2G4_F500`, `2G4_D500`, `2G4_D250`
@@ -69,7 +70,7 @@ cmake -B build -DCMAKE_TOOLCHAIN_FILE=firmware/toolchain-arm-none-eabi.cmake -DC
 cmake --build build -j$(nproc)
 ```
 
-### Run Host Unit Tests (9 Test Suites)
+### Run Host Unit Tests (10 Test Suites)
 ```bash
 mkdir -p build_host
 g++ -std=c++17 -O2 -Wall -Wextra -I. \
@@ -129,7 +130,22 @@ Send Reticulum drone commands (`GOTO`, `RTL`, `LOITER`, `LAND`, `MODE`, `ARM`, `
 
 # Downlink a Reticulum GPS/battery telemetry beacon over ELRS telemetry slots
 ./tools/lr2021_cli.py -p /dev/ttyACM7 rns-beacon --sim-gps 0 0 120 24800
+
+# Pair TX & RX Reticulum identities over the air (syncs RNode RF/IFAC config and discovers RX's 16B RNS address)
+./tools/lr2021_cli.py -p /dev/ttyACM5 rns-pair --ifac elrs-mesh
+./tools/lr2021_cli.py -p /dev/ttyACM5 rns-peers
+
+# Send a targeted Reticulum PING or LOITER command addressed specifically to the paired RX's 16B dest_hash
+./tools/lr2021_cli.py -p /dev/ttyACM5 rns-to sel PING
+./tools/lr2021_cli.py -p /dev/ttyACM5 rns-to sel LOITER
 ```
+
+### 2b. EdgeTX / OpenTX Handset Lua Script (`tools/rns_elrs.lua`)
+Copy [`tools/rns_elrs.lua`](tools/rns_elrs.lua) to `/SCRIPTS/TOOLS/rns_elrs.lua` on your EdgeTX handset SD card (supports both `480x272` ColorLCD radios like the RadioMaster TX16S MK3 and `128x64` B&W radios like Boxer/Pocket/Zorro) and launch **RNS-ELRS Mesh** from `SYS -> Tools`:
+- **Page 1 (Identity & Pairing):** Displays the TX module's 16-byte Reticulum `SINGLE` address (`tx_dest`), the bound/selected receiver's 16-byte Reticulum address (`rx_dest`), link lock, peer count, and ping RTT (`ms`). Trigger `[Pair & Sync RX]` (`RNSP`) or `[Announce TX]` (`RNSA`) with one click.
+- **Page 2 (RNode LoRa Config):** Configure Reticulum LoRa frequency (`868.000`, `869.525`, `915.000`, `2440.000 MHz`), bandwidth (`125..812.5 kHz`), spreading factor (`SF5..SF12`), coding rate (`4/5..4/8`), TX power, and IFAC, then click `[Apply & Push OTA to RX]`.
+- **Page 3 (Mesh Peers):** Browse up to 8 discovered Reticulum mesh peers (receivers, airborne relays, RNodes) with hop count, RSSI, SNR, and battery voltage; press `ENTER` on any peer to select it as the active target receiver.
+- **Page 4 (Targeted RX Cmd):** Send `[Ping RX]`, `[LOITER]`, `[RTL]`, `[LAND]`, `[ARM]`, or `[DISARM]` addressed directly to the selected receiver's 16-byte Reticulum destination hash (`RNSC`).
 
 ### 3. Passive OTA Monitor on a Live 2.4 GHz ExpressLRS Link (`CE_LBT` / `ISM2G4`)
 Sniff an active ExpressLRS link (both handset uplink and receiver downlink telemetry) without transmitting:
@@ -156,6 +172,12 @@ power <dbm>                           - Set TX output power in dBm (-20..22 Sub-
 mode <idle|tx|rx|monitor|bridge|rnode|relay> - Switch operating mode
 rnode_cfg <freq_hz> <bw_hz> <sf> <cr> - Configure RNode / Relay LoRa RF parameters
 bcn <now|interval_ms>                 - Send immediate Reticulum FC beacon or set periodic interval
+rns_id                                - Show this node's 16-byte Reticulum SINGLE address & identity hash
+rns_ann                               - Broadcast signed Reticulum node announce (RNSA)
+rns_pair [ifac_pass]                  - OTA sync Reticulum RF/IFAC config & pair bound RX (RNSP)
+rns_peers [select <idx>]              - List discovered Reticulum peers or select target RX
+rns_to <dest_hex|sel|bcast> <cmd>     - Send command/PING to a specific 16B Reticulum RX address (RNSC)
+crsf_lua <status|peer|ann|pair|ping..>- Exercise EdgeTX Lua CRSF 0x7A/0x7B telemetry bridge
 fc_sim <lat_e7> <lon_e7> <alt_m> <mv> - Set simulated FC telemetry state for beacon testing
 mav_rx <hex_bytes>                    - Feed raw MAVLink v1/v2 frame into FC telemetry parser
 rns_cmd <GOTO lat lon alt|RTL|LAND..> - Send Reticulum drone command over LoRa or ELRS tunnel
@@ -219,6 +241,16 @@ Tested on two `LR2021EVK1XBS1_XIAO` boards (`FC6D1A37` and `D56B6941`), a live *
 
 4. **Live 2.4 GHz `2G4_K1000` (`CE_LBT`, 80 channels, 1000 Hz GFSK + Hamming FEC, 1:2 telemetry) Passive `MONITOR` (`TX16SMK3` ↔ `XR4`):**
    - Captures 500 Hz TX16SMK3 uplink (`SYNC` + `RCDATA`) and 500 Hz XR4 downlink (`LINKSTATS` + CRSF telemetry `DATA` frames) simultaneously (`1,789 / 1,842 = 97.1%` combined packet CRC rate over `2.0 s`, `phase_err = 4 us`).
+5. **Over-the-Air Reticulum Pairing (`RNSP`), Node Announce Discovery (`RNSA`), Targeted 16-Byte Receiver Commands (`RNSC`) & EdgeTX Lua CRSF Bridge (`0x7A`/`0x7B`):**
+   - Verified distinct hardware-derived 16-byte Reticulum `SINGLE` addresses on Board 1 (`hw_id=292fecd1c3f50a7c -> dest=b535904babf85e6d9ef1ab15ec1061f9`) and Board 2 (`hw_id=f8be88db9cf69ef8 -> dest=4cef6984feb38c2429a1efa42b89c149`).
+   - Verified over-the-air `rns_pair elrs-mesh` from TX (`/dev/ttyACM5`) to RX (`/dev/ttyACM7`) over live `EU868 900_200HZ` FHSS: RX applied `freq=869525000 bw=250000 sf=8 cr=4/6 ifac=1` and replied with its 68-byte `RNSA` announce (`vbatt=25200mV`), automatically populating TX's peer table (`[0]* dest=4cef6984feb38c2429a1efa42b89c149`).
+   - Verified targeted `rns_to sel PING` (`RNS_PONG_RX rtt_ms=577`) and `crsf_lua loiter` (`RNS_TARGETED_CMD_RX mav_len=45 -> RNS_CMD_ACK_RX ack="ACK:LOITER" rtt_ms=636`) addressed specifically to RX's 16-byte Reticulum destination hash.
+   ```text
+   [RX] RNS_PAIRED src=ELRS_TUNNEL tx_dest=b535904babf85e6d9ef1ab15ec1061f9 rx_dest=4cef6984feb38c2429a1efa42b89c149 freq=869525000 bw=250000 sf=8 cr=4/6 pwr=14dBm ifac=1 reply_ann=1
+   [TX] RNS_PEER_ANNOUNCE src=ELRS_TUNNEL idx=0 dest=4cef6984feb38c2429a1efa42b89c149 role=2 hops=0 name="LR2021-RX" vbatt=25200mV mode=0
+   [TX] RNS_CMD_ACK_RX src=ELRS_TUNNEL from=4cef6984feb38c2429a1efa42b89c149 hops=0 seq=2 rtt_ms=636 ack="ACK:LOITER"
+   [TX] OK CRSF_LUA_STATUS len=62 mode=2 lock=2 freq=869525000 bw_khz=250 sf=8 cr=4/6 peers=1 rtt=636ms tx_dest=b535904babf85e6d9ef1ab15ec1061f9 rx_dest=4cef6984feb38c2429a1efa42b89c149
+   ```
 
 ### Limitations
 - Single-transceiver hardware (`1× LR2021` per EVK): Gemini X dual-band modes (`X150HZ_*`, `X100HZ_8CH_*`) can track or transmit on either the Sub-GHz leg or the 2.4 GHz leg one at a time, not both bands simultaneously on a single EVK. Likewise, a single EVK operates either as a dedicated `RNODE`/`RELAY` LoRa transceiver or as an `ELRS_TX`/`ELRS_RX` FHSS node tunneling Reticulum `DATA` frames.

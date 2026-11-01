@@ -833,3 +833,443 @@ bool elrs_tunnel_process_rx_frame(elrs_data_tunnel_t *t,
     }
     return false;
 }
+
+/* ---------------------------------------------------------------------------
+ * 5. Per-Node Reticulum Identity, Peer Table, OTA Pairing & Targeted Commands
+ * --------------------------------------------------------------------------- */
+static const uint32_t SHA256_K[64] = {
+    0x428a2f98UL, 0x71374491UL, 0xb5c0fbcfUL, 0xe9b5dba5UL,
+    0x3956c25bUL, 0x59f111f1UL, 0x923f82a4UL, 0xab1c5ed5UL,
+    0xd807aa98UL, 0x12835b01UL, 0x243185beUL, 0x550c7dc3UL,
+    0x72be5d74UL, 0x80deb1feUL, 0x9bdc06a7UL, 0xc19bf174UL,
+    0xe49b69c1UL, 0xefbe4786UL, 0x0fc19dc6UL, 0x240ca1ccUL,
+    0x2de92c6fUL, 0x4a7484aaUL, 0x5cb0a9dcUL, 0x76f988daUL,
+    0x983e5152UL, 0xa831c66dUL, 0xb00327c8UL, 0xbf597fc7UL,
+    0xc6e00bf3UL, 0xd5a79147UL, 0x06ca6351UL, 0x14292967UL,
+    0x27b70a85UL, 0x2e1b2138UL, 0x4d2c6dfcUL, 0x53380d13UL,
+    0x650a7354UL, 0x766a0abbUL, 0x81c2c92eUL, 0x92722c85UL,
+    0xa2bfe8a1UL, 0xa81a664bUL, 0xc24b8b70UL, 0xc76c51a3UL,
+    0xd192e819UL, 0xd6990624UL, 0xf40e3585UL, 0x106aa070UL,
+    0x19a4c116UL, 0x1e376c08UL, 0x2748774cUL, 0x34b0bcb5UL,
+    0x391c0cb3UL, 0x4ed8aa4aUL, 0x5b9cca4fUL, 0x682e6ff3UL,
+    0x748f82eeUL, 0x78a5636fUL, 0x84c87814UL, 0x8cc70208UL,
+    0x90befffaUL, 0xa4506cebUL, 0xbef9a3f7UL, 0xc67178f2UL
+};
+
+static inline uint32_t rotr32(uint32_t x, uint32_t n) {
+    return (x >> n) | (x << (32U - n));
+}
+
+static void sha256_transform(uint32_t state[8], const uint8_t block[64]) {
+    uint32_t w[64];
+    for (uint8_t i = 0U; i < 16U; i++) {
+        w[i] = ((uint32_t)block[i * 4U] << 24U) |
+               ((uint32_t)block[i * 4U + 1U] << 16U) |
+               ((uint32_t)block[i * 4U + 2U] << 8U) |
+               ((uint32_t)block[i * 4U + 3U]);
+    }
+    for (uint8_t i = 16U; i < 64U; i++) {
+        uint32_t s0 = rotr32(w[i - 15U], 7U) ^ rotr32(w[i - 15U], 18U) ^ (w[i - 15U] >> 3U);
+        uint32_t s1 = rotr32(w[i - 2U], 17U) ^ rotr32(w[i - 2U], 19U) ^ (w[i - 2U] >> 10U);
+        w[i] = w[i - 16U] + s0 + w[i - 7U] + s1;
+    }
+
+    uint32_t a = state[0], b = state[1], c = state[2], d = state[3];
+    uint32_t e = state[4], f = state[5], g = state[6], h = state[7];
+
+    for (uint8_t i = 0U; i < 64U; i++) {
+        uint32_t S1 = rotr32(e, 6U) ^ rotr32(e, 11U) ^ rotr32(e, 25U);
+        uint32_t ch = (e & f) ^ ((~e) & g);
+        uint32_t t1 = h + S1 + ch + SHA256_K[i] + w[i];
+        uint32_t S0 = rotr32(a, 2U) ^ rotr32(a, 13U) ^ rotr32(a, 22U);
+        uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+        uint32_t t2 = S0 + maj;
+
+        h = g;
+        g = f;
+        f = e;
+        e = d + t1;
+        d = c;
+        c = b;
+        b = a;
+        a = t1 + t2;
+    }
+
+    state[0] += a; state[1] += b; state[2] += c; state[3] += d;
+    state[4] += e; state[5] += f; state[6] += g; state[7] += h;
+}
+
+void rns_sha256(const uint8_t *data, size_t len, uint8_t out_hash[32]) {
+    uint32_t state[8] = {
+        0x6a09e667UL, 0xbb67ae85UL, 0x3c6ef372UL, 0xa54ff53aUL,
+        0x510e527fUL, 0x9b05688cUL, 0x1f83d9abUL, 0x5be0cd19UL
+    };
+    uint8_t block[64];
+    size_t offset = 0U;
+    while (len - offset >= 64U) {
+        sha256_transform(state, data + offset);
+        offset += 64U;
+    }
+    size_t rem = len - offset;
+    memset(block, 0, sizeof(block));
+    if (rem > 0U && data != NULL) {
+        memcpy(block, data + offset, rem);
+    }
+    block[rem] = 0x80U;
+    if (rem >= 56U) {
+        sha256_transform(state, block);
+        memset(block, 0, sizeof(block));
+    }
+    uint64_t bit_len = (uint64_t)len * 8ULL;
+    for (uint8_t i = 0U; i < 8U; i++) {
+        block[63U - i] = (uint8_t)((bit_len >> (i * 8U)) & 0xFFULL);
+    }
+    sha256_transform(state, block);
+
+    for (uint8_t i = 0U; i < 8U; i++) {
+        out_hash[i * 4U]      = (uint8_t)((state[i] >> 24U) & 0xFFU);
+        out_hash[i * 4U + 1U] = (uint8_t)((state[i] >> 16U) & 0xFFU);
+        out_hash[i * 4U + 2U] = (uint8_t)((state[i] >> 8U) & 0xFFU);
+        out_hash[i * 4U + 3U] = (uint8_t)(state[i] & 0xFFU);
+    }
+}
+
+void rns_identity_init(rns_node_identity_t *id,
+                       const uint8_t hw_device_id[8],
+                       const uint8_t elrs_uid[6],
+                       uint8_t role,
+                       const char *name) {
+    if (id == NULL) return;
+    memset(id, 0, sizeof(*id));
+    if (hw_device_id != NULL) {
+        memcpy(id->hw_device_id, hw_device_id, 8U);
+    }
+    if (elrs_uid != NULL) {
+        memcpy(id->elrs_uid, elrs_uid, 6U);
+    }
+    id->role = role;
+    if (name != NULL) {
+        strncpy(id->name, name, sizeof(id->name) - 1U);
+    }
+
+    /* Derive 64-byte public identity material (X25519 32B + Ed25519 32B) */
+    uint8_t seed_buf[24];
+    memcpy(seed_buf, "RNS-X25519", 10U);
+    memcpy(&seed_buf[10], id->hw_device_id, 8U);
+    memcpy(&seed_buf[18], id->elrs_uid, 6U);
+    rns_sha256(seed_buf, sizeof(seed_buf), &id->pub_key[0]);
+
+    memcpy(seed_buf, "RNS-ED2551", 10U);
+    rns_sha256(seed_buf, sizeof(seed_buf), &id->pub_key[32]);
+
+    /* Reticulum identity_hash = SHA256(pub_key)[:16] */
+    uint8_t full_hash[32];
+    rns_sha256(id->pub_key, 64U, full_hash);
+    memcpy(id->identity_hash, full_hash, 16U);
+
+    /* Reticulum SINGLE destination hash:
+     * name_hash = SHA256("elrs.rns.node")[:10]
+     * dest_hash = SHA256(name_hash || identity_hash)[:16]
+     */
+    uint8_t name_full[32];
+    const char *app_aspect = "elrs.rns.node";
+    rns_sha256((const uint8_t *)app_aspect, strlen(app_aspect), name_full);
+
+    uint8_t addr_material[26];
+    memcpy(addr_material, name_full, 10U);
+    memcpy(&addr_material[10], id->identity_hash, 16U);
+    rns_sha256(addr_material, sizeof(addr_material), full_hash);
+    memcpy(id->dest_hash, full_hash, 16U);
+}
+
+void rns_identity_set_ifac(rns_node_identity_t *id, bool enabled, const char *passphrase) {
+    if (id == NULL) return;
+    id->ifac_enabled = enabled;
+    memset(id->ifac_pass, 0, sizeof(id->ifac_pass));
+    if (passphrase != NULL) {
+        strncpy(id->ifac_pass, passphrase, sizeof(id->ifac_pass) - 1U);
+    }
+    uint8_t full[32];
+    rns_sha256((const uint8_t *)id->ifac_pass, strlen(id->ifac_pass), full);
+    memcpy(id->ifac_key, full, 16U);
+}
+
+void rns_peer_table_init(rns_peer_table_t *pt) {
+    if (pt == NULL) return;
+    memset(pt, 0, sizeof(*pt));
+    pt->selected_idx = -1;
+}
+
+size_t rns_build_node_announce(const rns_node_identity_t *id,
+                               uint32_t freq_hz,
+                               uint32_t bw_hz,
+                               uint8_t sf,
+                               uint8_t cr,
+                               const rns_fc_telemetry_t *tlm,
+                               uint8_t *out_pkt,
+                               size_t max_len) {
+    if (id == NULL || out_pkt == NULL || max_len < 68U) {
+        return 0U;
+    }
+    memset(out_pkt, 0, 68U);
+    out_pkt[0] = 0x01U; /* HEADER_1 | BROADCAST | SINGLE | ANNOUNCE */
+    out_pkt[1] = 0x00U; /* hops = 0 */
+    memcpy(&out_pkt[2], id->dest_hash, 16U);
+    out_pkt[18] = 0x00U; /* context */
+
+    /* Payload [19..67]:
+     * [19..22] "RNSA" magic (4B)
+     * [23..38] identity_hash (16B)
+     * [39]     role (1B)
+     * [40..51] node name (12B)
+     * [52..55] freq_hz (4B LE)
+     * [56..59] bw_hz (4B LE)
+     * [60]     sf (1B)
+     * [61]     cr (1B)
+     * [62..63] vbatt_mv (2B LE)
+     * [64]     custom_mode (1B)
+     * [65]     armed (1B)
+     * [66..67] 2B SHA-256 auth tag
+     */
+    memcpy(&out_pkt[19], "RNSA", 4U);
+    memcpy(&out_pkt[23], id->identity_hash, 16U);
+    out_pkt[39] = id->role;
+    memcpy(&out_pkt[40], id->name, 12U);
+    write_u32_le(&out_pkt[52], freq_hz);
+    write_u32_le(&out_pkt[56], bw_hz);
+    out_pkt[60] = sf;
+    out_pkt[61] = cr;
+    write_u16_le(&out_pkt[62], tlm ? tlm->vbatt_mv : 0U);
+    out_pkt[64] = tlm ? tlm->custom_mode : 0U;
+    out_pkt[65] = (tlm && tlm->armed) ? 1U : 0U;
+
+    uint8_t digest[32];
+    rns_sha256(&out_pkt[2], 64U, digest);
+    out_pkt[66] = digest[0];
+    out_pkt[67] = digest[1];
+    return 68U;
+}
+
+bool rns_parse_node_announce(const uint8_t *pkt,
+                             size_t len,
+                             int8_t rssi_dbm,
+                             int8_t snr_db,
+                             uint32_t now_ms,
+                             rns_peer_table_t *pt) {
+    if (pkt == NULL || pt == NULL || len < 19U) {
+        return false;
+    }
+    /* Match either compact 68B RNSA announce OR standard RNS ANNOUNCE (pkt[0] & 0x03 == 0x01) */
+    if ((pkt[0] & 0x03U) != 0x01U) {
+        return false;
+    }
+
+    uint8_t dest_hash[16];
+    memcpy(dest_hash, &pkt[2], 16U);
+
+    bool is_rnsa = (len >= 68U && memcmp(&pkt[19], "RNSA", 4U) == 0);
+    if (is_rnsa) {
+        uint8_t digest[32];
+        rns_sha256(&pkt[2], 64U, digest);
+        if (pkt[66] != digest[0] || pkt[67] != digest[1]) {
+            return false;
+        }
+    }
+
+    /* Find existing peer slot or allocate a slot */
+    int slot = -1;
+    for (uint8_t i = 0U; i < pt->count; i++) {
+        if (pt->peers[i].valid && memcmp(pt->peers[i].dest_hash, dest_hash, 16U) == 0) {
+            slot = (int)i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        if (pt->count < RNS_MAX_PEERS) {
+            slot = (int)pt->count++;
+        } else {
+            /* Evict oldest peer */
+            slot = 0;
+            uint32_t oldest_age = 0U;
+            for (uint8_t i = 0U; i < RNS_MAX_PEERS; i++) {
+                uint32_t age = now_ms - pt->peers[i].last_seen_ms;
+                if (age >= oldest_age) {
+                    oldest_age = age;
+                    slot = (int)i;
+                }
+            }
+        }
+    }
+
+    rns_peer_entry_t *e = &pt->peers[slot];
+    e->valid = true;
+    memcpy(e->dest_hash, dest_hash, 16U);
+    e->hops         = pkt[1];
+    e->rssi_dbm     = rssi_dbm;
+    e->snr_db       = snr_db;
+    e->last_seen_ms = now_ms;
+
+    if (is_rnsa) {
+        memcpy(e->identity_hash, &pkt[23], 16U);
+        e->role = pkt[39];
+        memset(e->name, 0, sizeof(e->name));
+        memcpy(e->name, &pkt[40], 12U);
+        e->freq_hz     = read_u32_le(&pkt[52]);
+        e->bw_hz       = read_u32_le(&pkt[56]);
+        e->sf          = pkt[60];
+        e->cr          = pkt[61];
+        e->vbatt_mv    = read_u16_le(&pkt[62]);
+        e->custom_mode = pkt[64];
+        e->armed       = (pkt[65] != 0U);
+    } else if (len >= 83U) {
+        /* Standard Reticulum ANNOUNCE: [19..82] is 64B public key */
+        uint8_t id_full[32];
+        rns_sha256(&pkt[19], 64U, id_full);
+        memcpy(e->identity_hash, id_full, 16U);
+        e->role = RNS_NODE_ROLE_RNODE;
+        snprintf(e->name, sizeof(e->name), "RNS-%02X%02X", dest_hash[0], dest_hash[1]);
+    }
+
+    if (pt->selected_idx < 0) {
+        pt->selected_idx = (int8_t)slot;
+    }
+    return true;
+}
+
+/* SHA256(SHA256("elrs.rns.pair")[:10])[:16] broadcast pairing destination */
+static const uint8_t RNS_DEST_PAIRING_BCAST[16] = {
+    0x4a, 0x91, 0xc3, 0x0e, 0x55, 0xb2, 0x7d, 0x84,
+    0x19, 0x6f, 0xe0, 0x3b, 0xa8, 0x12, 0x9c, 0x5d
+};
+
+static bool is_all_zeros_16(const uint8_t b[16]) {
+    for (uint8_t i = 0U; i < 16U; i++) {
+        if (b[i] != 0U) return false;
+    }
+    return true;
+}
+
+size_t rns_build_pairing_pkt(const rns_pairing_cfg_t *cfg,
+                             uint8_t *out_pkt,
+                             size_t max_len) {
+    if (cfg == NULL || out_pkt == NULL || max_len < 68U) {
+        return 0U;
+    }
+    memset(out_pkt, 0, 68U);
+    bool bcast = is_all_zeros_16(cfg->target_dest);
+    out_pkt[0] = bcast ? 0x08U : 0x00U; /* PLAIN DATA or SINGLE DATA */
+    out_pkt[1] = 0x00U;                 /* hops = 0 */
+    memcpy(&out_pkt[2], bcast ? RNS_DEST_PAIRING_BCAST : cfg->target_dest, 16U);
+    out_pkt[18] = 0xA5U;                /* Pairing context */
+
+    memcpy(&out_pkt[19], "RNSP", 4U);
+    memcpy(&out_pkt[23], cfg->tx_dest, 16U);
+    write_u32_le(&out_pkt[39], cfg->freq_hz);
+    write_u32_le(&out_pkt[43], cfg->bw_hz);
+    out_pkt[47] = cfg->sf;
+    out_pkt[48] = cfg->cr;
+    out_pkt[49] = (uint8_t)cfg->txpower_dbm;
+    out_pkt[50] = cfg->ifac_enabled ? 1U : 0U;
+    memcpy(&out_pkt[51], cfg->ifac_pass, 15U);
+
+    uint8_t digest[32];
+    rns_sha256(&out_pkt[2], 64U, digest);
+    out_pkt[66] = digest[0];
+    out_pkt[67] = digest[1];
+    return 68U;
+}
+
+bool rns_parse_pairing_pkt(const uint8_t *pkt,
+                           size_t len,
+                           const uint8_t local_dest[16],
+                           rns_pairing_cfg_t *out_cfg) {
+    if (pkt == NULL || out_cfg == NULL || len < 68U) {
+        return false;
+    }
+    if (pkt[18] != 0xA5U || memcmp(&pkt[19], "RNSP", 4U) != 0) {
+        return false;
+    }
+    uint8_t digest[32];
+    rns_sha256(&pkt[2], 64U, digest);
+    if (pkt[66] != digest[0] || pkt[67] != digest[1]) {
+        return false;
+    }
+
+    bool match_bcast = (memcmp(&pkt[2], RNS_DEST_PAIRING_BCAST, 16U) == 0);
+    bool match_local = (local_dest != NULL && memcmp(&pkt[2], local_dest, 16U) == 0);
+    if (!match_bcast && !match_local) {
+        return false;
+    }
+
+    memset(out_cfg, 0, sizeof(*out_cfg));
+    if (match_local) {
+        memcpy(out_cfg->target_dest, &pkt[2], 16U);
+    }
+    memcpy(out_cfg->tx_dest, &pkt[23], 16U);
+    out_cfg->freq_hz      = read_u32_le(&pkt[39]);
+    out_cfg->bw_hz        = read_u32_le(&pkt[43]);
+    out_cfg->sf           = pkt[47];
+    out_cfg->cr           = pkt[48];
+    out_cfg->txpower_dbm  = (int8_t)pkt[49];
+    out_cfg->ifac_enabled = (pkt[50] != 0U);
+    memcpy(out_cfg->ifac_pass, &pkt[51], 15U);
+    out_cfg->ifac_pass[15] = '\0';
+    return true;
+}
+
+size_t rns_build_targeted_cmd_pkt(const uint8_t target_dest[16],
+                                  const uint8_t sender_dest[16],
+                                  uint8_t seq,
+                                  const char *cmd_str,
+                                  uint8_t *out_pkt,
+                                  size_t max_len) {
+    if (target_dest == NULL || sender_dest == NULL || cmd_str == NULL || out_pkt == NULL) {
+        return 0U;
+    }
+    size_t slen = strlen(cmd_str);
+    if (40U + slen > max_len) {
+        return 0U;
+    }
+    bool bcast = is_all_zeros_16(target_dest);
+    out_pkt[0] = bcast ? 0x08U : 0x00U; /* HEADER_1 | SINGLE/PLAIN | DATA */
+    out_pkt[1] = 0x00U;                 /* hops = 0 */
+    memcpy(&out_pkt[2], bcast ? RNS_DEST_DRONE_CMD : target_dest, 16U);
+    out_pkt[18] = 0xA6U;                /* Targeted command context */
+    memcpy(&out_pkt[19], "RNSC", 4U);
+    memcpy(&out_pkt[23], sender_dest, 16U);
+    out_pkt[39] = seq;
+    memcpy(&out_pkt[40], cmd_str, slen);
+    return 40U + slen;
+}
+
+bool rns_parse_targeted_cmd_pkt(const uint8_t *pkt,
+                                size_t len,
+                                const uint8_t local_dest[16],
+                                uint8_t out_sender_dest[16],
+                                uint8_t *out_seq,
+                                char *out_cmd_str,
+                                size_t max_cmd_str) {
+    if (pkt == NULL || len <= 40U || pkt[18] != 0xA6U || memcmp(&pkt[19], "RNSC", 4U) != 0) {
+        return false;
+    }
+    bool match_bcast = (memcmp(&pkt[2], RNS_DEST_DRONE_CMD, 16U) == 0);
+    bool match_local = (local_dest != NULL && memcmp(&pkt[2], local_dest, 16U) == 0);
+    if (!match_bcast && !match_local) {
+        return false;
+    }
+    if (out_sender_dest != NULL) {
+        memcpy(out_sender_dest, &pkt[23], 16U);
+    }
+    if (out_seq != NULL) {
+        *out_seq = pkt[39];
+    }
+    if (out_cmd_str != NULL && max_cmd_str > 0U) {
+        size_t slen = len - 40U;
+        if (slen >= max_cmd_str) {
+            slen = max_cmd_str - 1U;
+        }
+        memcpy(out_cmd_str, &pkt[40], slen);
+        out_cmd_str[slen] = '\0';
+    }
+    return true;
+}

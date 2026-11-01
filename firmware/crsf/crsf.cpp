@@ -153,3 +153,239 @@ bool crsf_parser_feed_byte(crsf_parser_t *parser, uint8_t byte) {
     }
     return false;
 }
+
+static void write_be16(uint8_t *b, uint16_t v) {
+    b[0] = (uint8_t)(v >> 8U);
+    b[1] = (uint8_t)(v & 0xFFU);
+}
+
+static uint16_t read_be16(const uint8_t *b) {
+    return (uint16_t)(((uint16_t)b[0] << 8U) | b[1]);
+}
+
+static void write_be32(uint8_t *b, uint32_t v) {
+    b[0] = (uint8_t)(v >> 24U);
+    b[1] = (uint8_t)((v >> 16U) & 0xFFU);
+    b[2] = (uint8_t)((v >> 8U) & 0xFFU);
+    b[3] = (uint8_t)(v & 0xFFU);
+}
+
+static uint32_t read_be32(const uint8_t *b) {
+    return ((uint32_t)b[0] << 24U) |
+           ((uint32_t)b[1] << 16U) |
+           ((uint32_t)b[2] << 8U)  |
+           (uint32_t)b[3];
+}
+
+size_t crsf_build_device_info_frame(const char *device_name, uint32_t serial_no, uint8_t out_frame[CRSF_MAX_FRAME_LEN]) {
+    if (device_name == NULL || out_frame == NULL) return 0U;
+    size_t nlen = strlen(device_name);
+    if (nlen > 24U) nlen = 24U;
+
+    size_t idx = 0U;
+    out_frame[idx++] = CRSF_ADDRESS_HANDSET;
+    out_frame[idx++] = 0U; /* length placeholder */
+    out_frame[idx++] = CRSF_FRAMETYPE_DEVICE_INFO;
+    out_frame[idx++] = CRSF_ADDRESS_HANDSET;
+    out_frame[idx++] = CRSF_ADDRESS_CRSF_TRANSMITTER;
+    memcpy(&out_frame[idx], device_name, nlen);
+    idx += nlen;
+    out_frame[idx++] = '\0';
+    write_be32(&out_frame[idx], serial_no); idx += 4U;
+    write_be32(&out_frame[idx], 0x00011800UL); idx += 4U; /* HW ver: LR2021 0x0118 */
+    write_be32(&out_frame[idx], 0x00013F00UL); idx += 4U; /* SW ver: 1.63.0 */
+    out_frame[idx++] = 0U; /* parameter count */
+    out_frame[idx++] = 0U; /* parameter protocol version */
+
+    out_frame[1] = (uint8_t)(idx - 1U); /* type..payload + crc */
+    out_frame[idx] = crsf_crc8(&out_frame[2], idx - 2U);
+    return idx + 1U;
+}
+
+size_t crsf_build_rns_status_frame(const crsf_rns_status_t *st, uint8_t out_frame[CRSF_MAX_FRAME_LEN]) {
+    if (st == NULL || out_frame == NULL) return 0U;
+    /* Frame layout (62 bytes total):
+     * [0]     0xEA (CRSF_ADDRESS_HANDSET)
+     * [1]     60   (type + ext_hdr + subcmd + 55B payload + crc)
+     * [2]     0x7B (CRSF_FRAMETYPE_RNS_TLM)
+     * [3]     0xEA (dest = Handset)
+     * [4]     0xEE (orig = TX Module)
+     * [5]     0x81 (CRSF_RNS_RESP_STATUS)
+     * [6..21] tx_dest[16]
+     * [22..37]rx_dest[16]
+     * [38]    app_mode
+     * [39]    lock_state
+     * [40]    elrs_rate_idx
+     * [41]    ifac_enabled
+     * [42..45]rnode_freq_hz (BE32)
+     * [46..47]rnode_bw_khz  (BE16)
+     * [48]    rnode_sf
+     * [49]    rnode_cr
+     * [50]    rnode_txpower
+     * [51]    peer_count
+     * [52]    selected_peer
+     * [53..54]last_ping_rtt_ms (BE16)
+     * [55..56]tx_msgs (BE16)
+     * [57..58]rx_msgs (BE16)
+     * [59..60]relayed_msgs (BE16)
+     * [61]    crc8
+     */
+    memset(out_frame, 0, 62U);
+    out_frame[0] = CRSF_ADDRESS_HANDSET;
+    out_frame[1] = 60U;
+    out_frame[2] = CRSF_FRAMETYPE_RNS_TLM;
+    out_frame[3] = CRSF_ADDRESS_HANDSET;
+    out_frame[4] = CRSF_ADDRESS_CRSF_TRANSMITTER;
+    out_frame[5] = CRSF_RNS_RESP_STATUS;
+
+    memcpy(&out_frame[6], st->tx_dest, 16U);
+    memcpy(&out_frame[22], st->rx_dest, 16U);
+    out_frame[38] = st->app_mode;
+    out_frame[39] = st->lock_state;
+    out_frame[40] = st->elrs_rate_idx;
+    out_frame[41] = st->ifac_enabled ? 1U : 0U;
+    write_be32(&out_frame[42], st->rnode_freq_hz);
+    write_be16(&out_frame[46], st->rnode_bw_khz);
+    out_frame[48] = st->rnode_sf;
+    out_frame[49] = st->rnode_cr;
+    out_frame[50] = (uint8_t)st->rnode_txpower;
+    out_frame[51] = st->peer_count;
+    out_frame[52] = st->selected_peer;
+    write_be16(&out_frame[53], st->last_ping_rtt_ms);
+    write_be16(&out_frame[55], st->tx_msgs);
+    write_be16(&out_frame[57], st->rx_msgs);
+    write_be16(&out_frame[59], st->relayed_msgs);
+    out_frame[61] = crsf_crc8(&out_frame[2], 59U);
+    return 62U;
+}
+
+bool crsf_decode_rns_status_frame(const uint8_t *frame, size_t frame_len, crsf_rns_status_t *out_st) {
+    if (frame == NULL || out_st == NULL || frame_len < 62U) return false;
+    if (frame[1] != 60U || frame[2] != CRSF_FRAMETYPE_RNS_TLM || frame[5] != CRSF_RNS_RESP_STATUS) {
+        return false;
+    }
+    if (crsf_crc8(&frame[2], 59U) != frame[61]) {
+        return false;
+    }
+    memset(out_st, 0, sizeof(*out_st));
+    memcpy(out_st->tx_dest, &frame[6], 16U);
+    memcpy(out_st->rx_dest, &frame[22], 16U);
+    out_st->app_mode         = frame[38];
+    out_st->lock_state       = frame[39];
+    out_st->elrs_rate_idx    = frame[40];
+    out_st->ifac_enabled     = (frame[41] != 0U);
+    out_st->rnode_freq_hz    = read_be32(&frame[42]);
+    out_st->rnode_bw_khz     = read_be16(&frame[46]);
+    out_st->rnode_sf         = frame[48];
+    out_st->rnode_cr         = frame[49];
+    out_st->rnode_txpower    = (int8_t)frame[50];
+    out_st->peer_count       = frame[51];
+    out_st->selected_peer    = frame[52];
+    out_st->last_ping_rtt_ms = read_be16(&frame[53]);
+    out_st->tx_msgs          = read_be16(&frame[55]);
+    out_st->rx_msgs          = read_be16(&frame[57]);
+    out_st->relayed_msgs     = read_be16(&frame[59]);
+    return true;
+}
+
+size_t crsf_build_rns_peer_frame(const crsf_rns_peer_info_t *pi, uint8_t out_frame[CRSF_MAX_FRAME_LEN]) {
+    if (pi == NULL || out_frame == NULL) return 0U;
+    /* Frame layout (48 bytes total):
+     * [0]     0xEA
+     * [1]     46
+     * [2]     0x7B (CRSF_FRAMETYPE_RNS_TLM)
+     * [3]     0xEA
+     * [4]     0xEE
+     * [5]     0x82 (CRSF_RNS_RESP_PEER)
+     * [6]     peer_idx
+     * [7]     total_peers
+     * [8]     is_selected
+     * [9]     role
+     * [10..25]dest_hash[16]
+     * [26..37]name[12]
+     * [38]    hops
+     * [39]    rssi_dbm
+     * [40]    snr_db
+     * [41]    armed
+     * [42]    custom_mode
+     * [43..44]vbatt_mv (BE16)
+     * [45..46]age_s    (BE16)
+     * [47]    crc8
+     */
+    memset(out_frame, 0, 48U);
+    out_frame[0] = CRSF_ADDRESS_HANDSET;
+    out_frame[1] = 46U;
+    out_frame[2] = CRSF_FRAMETYPE_RNS_TLM;
+    out_frame[3] = CRSF_ADDRESS_HANDSET;
+    out_frame[4] = CRSF_ADDRESS_CRSF_TRANSMITTER;
+    out_frame[5] = CRSF_RNS_RESP_PEER;
+    out_frame[6] = pi->peer_idx;
+    out_frame[7] = pi->total_peers;
+    out_frame[8] = pi->is_selected ? 1U : 0U;
+    out_frame[9] = pi->role;
+    memcpy(&out_frame[10], pi->dest_hash, 16U);
+    memcpy(&out_frame[26], pi->name, 12U);
+    out_frame[38] = pi->hops;
+    out_frame[39] = (uint8_t)pi->rssi_dbm;
+    out_frame[40] = (uint8_t)pi->snr_db;
+    out_frame[41] = pi->armed ? 1U : 0U;
+    out_frame[42] = pi->custom_mode;
+    write_be16(&out_frame[43], pi->vbatt_mv);
+    write_be16(&out_frame[45], pi->age_s);
+    out_frame[47] = crsf_crc8(&out_frame[2], 45U);
+    return 48U;
+}
+
+bool crsf_decode_rns_peer_frame(const uint8_t *frame, size_t frame_len, crsf_rns_peer_info_t *out_pi) {
+    if (frame == NULL || out_pi == NULL || frame_len < 48U) return false;
+    if (frame[1] != 46U || frame[2] != CRSF_FRAMETYPE_RNS_TLM || frame[5] != CRSF_RNS_RESP_PEER) {
+        return false;
+    }
+    if (crsf_crc8(&frame[2], 45U) != frame[47]) {
+        return false;
+    }
+    memset(out_pi, 0, sizeof(*out_pi));
+    out_pi->peer_idx    = frame[6];
+    out_pi->total_peers = frame[7];
+    out_pi->is_selected = (frame[8] != 0U);
+    out_pi->role        = frame[9];
+    memcpy(out_pi->dest_hash, &frame[10], 16U);
+    memcpy(out_pi->name, &frame[26], 12U);
+    out_pi->hops        = frame[38];
+    out_pi->rssi_dbm    = (int8_t)frame[39];
+    out_pi->snr_db      = (int8_t)frame[40];
+    out_pi->armed       = (frame[41] != 0U);
+    out_pi->custom_mode = frame[42];
+    out_pi->vbatt_mv    = read_be16(&frame[43]);
+    out_pi->age_s       = read_be16(&frame[45]);
+    return true;
+}
+
+size_t crsf_build_rns_ack_frame(uint8_t subcmd, uint8_t status_code, uint8_t out_frame[CRSF_MAX_FRAME_LEN]) {
+    if (out_frame == NULL) return 0U;
+    out_frame[0] = CRSF_ADDRESS_HANDSET;
+    out_frame[1] = 7U;
+    out_frame[2] = CRSF_FRAMETYPE_RNS_TLM;
+    out_frame[3] = CRSF_ADDRESS_HANDSET;
+    out_frame[4] = CRSF_ADDRESS_CRSF_TRANSMITTER;
+    out_frame[5] = CRSF_RNS_RESP_ACK;
+    out_frame[6] = subcmd;
+    out_frame[7] = status_code;
+    out_frame[8] = crsf_crc8(&out_frame[2], 6U);
+    return 9U;
+}
+
+size_t crsf_build_rns_cmd_frame(uint8_t subcmd, const uint8_t *payload, size_t pay_len, uint8_t out_frame[CRSF_MAX_FRAME_LEN]) {
+    if (out_frame == NULL || (pay_len + 7U) > CRSF_MAX_FRAME_LEN) return 0U;
+    out_frame[0] = CRSF_ADDRESS_CRSF_TRANSMITTER;
+    out_frame[1] = (uint8_t)(5U + pay_len);
+    out_frame[2] = CRSF_FRAMETYPE_RNS_CMD;
+    out_frame[3] = CRSF_ADDRESS_CRSF_TRANSMITTER;
+    out_frame[4] = CRSF_ADDRESS_HANDSET;
+    out_frame[5] = subcmd;
+    if (payload != NULL && pay_len > 0U) {
+        memcpy(&out_frame[6], payload, pay_len);
+    }
+    out_frame[6U + pay_len] = crsf_crc8(&out_frame[2], 4U + pay_len);
+    return 7U + pay_len;
+}

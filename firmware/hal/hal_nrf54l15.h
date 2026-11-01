@@ -15,6 +15,9 @@ typedef void (*hal_timer_cb_t)(void);
 /* Initialize clocks (128 MHz CPU, 32 MHz HFXO), timers, GPIOs, UARTE22 (USB), UARTE21 (CRSF), SPIM00 (LR2021) */
 void hal_init(void);
 
+/* Read factory-programmed 64-bit hardware device ID from FICR.INFO.DEVICEID[0..1] */
+void hal_get_device_id(uint8_t out_id[8]);
+
 /* Monotonic 1 MHz (1 us) hardware clock on TIMER10 */
 uint32_t hal_micros(void);
 uint32_t hal_millis(void);

@@ -158,6 +158,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_rcmd.add_argument("command", nargs="+",
                         help="Command string (e.g. GOTO 0 0 85 | RTL | LOITER | LAND | ARM | DISARM)")
 
+    sub.add_parser("rns-id", help="Query this node's 16-byte Reticulum SINGLE destination hash and identity")
+    sub.add_parser("rns-ann", help="Broadcast a signed Reticulum node announce (RNSA) over LoRa or ELRS tunnel")
+
+    p_rpair = sub.add_parser("rns-pair", help="Over-the-air Reticulum pairing & RNode/IFAC config sync to bound RX")
+    p_rpair.add_argument("--ifac", help="Optional IFAC passphrase (or 'off' to disable)")
+
+    p_rpeers = sub.add_parser("rns-peers", help="List discovered Reticulum mesh peers or select target RX")
+    p_rpeers.add_argument("--select", type=int, help="Select peer index (0..7) as active target RX")
+
+    p_rto = sub.add_parser("rns-to", help="Send targeted Reticulum command or PING to a specific 16B RX address")
+    p_rto.add_argument("dest", help="32-char hex destination hash, 'sel' (selected peer), or 'bcast'")
+    p_rto.add_argument("command", nargs="+", help="PING | LOITER | RTL | LAND | ARM | DISARM | MODE n | GOTO ...")
+
+    p_clua = sub.add_parser("crsf-lua", help="Exercise EdgeTX Lua CRSF 0x7A/0x7B telemetry bridge")
+    p_clua.add_argument("action", choices=["status", "peer", "ann", "pair", "ping", "loiter", "rtl", "land", "arm", "disarm"])
+    p_clua.add_argument("--peer-idx", type=int, default=0, help="Peer index when action is 'peer'")
+
     p_rtx = sub.add_parser("rns-tx", help="Transmit or tunnel raw hex Reticulum packet")
     p_rtx.add_argument("hex_payload", help="Hexadecimal Reticulum packet bytes")
 
@@ -283,6 +300,24 @@ def main() -> int:
         elif args.subcmd == "rns-cmd":
             cmd_str = " ".join(args.command)
             print(node.send_cmd(f"rns_cmd {cmd_str}", wait_s=0.35))
+        elif args.subcmd == "rns-id":
+            print(node.send_cmd("rns_id", wait_s=0.25))
+        elif args.subcmd == "rns-ann":
+            print(node.send_cmd("rns_ann", wait_s=0.5))
+        elif args.subcmd == "rns-pair":
+            arg_str = f" {args.ifac}" if args.ifac else ""
+            print(node.send_cmd(f"rns_pair{arg_str}", wait_s=0.8))
+        elif args.subcmd == "rns-peers":
+            if args.select is not None:
+                print(node.send_cmd(f"rns_peers select {args.select}", wait_s=0.25))
+            else:
+                print(node.send_cmd("rns_peers", wait_s=0.3))
+        elif args.subcmd == "rns-to":
+            cmd_str = " ".join(args.command)
+            print(node.send_cmd(f"rns_to {args.dest} {cmd_str}", wait_s=0.6))
+        elif args.subcmd == "crsf-lua":
+            extra = f" {args.peer_idx}" if args.action == "peer" else ""
+            print(node.send_cmd(f"crsf_lua {args.action}{extra}", wait_s=0.5))
         elif args.subcmd == "rns-tx":
             print(node.send_cmd(f"rns_tx {args.hex_payload}", wait_s=0.35))
         elif args.subcmd == "rnode-kiss-test":
