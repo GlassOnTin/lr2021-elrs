@@ -21,6 +21,7 @@ add_executable(lr2021_elrs.elf
     firmware/radio/lr2021_driver.cpp
     firmware/elrs/elrs_protocol.cpp
     firmware/crsf/crsf.cpp
+    firmware/rnode/rns_node.cpp
     firmware/src/main.cpp
 )
 
@@ -33,6 +34,7 @@ target_include_directories(lr2021_elrs.elf PRIVATE
     firmware/radio
     firmware/elrs
     firmware/crsf
+    firmware/rnode
 )
 
 add_custom_command(TARGET lr2021_elrs.elf POST_BUILD

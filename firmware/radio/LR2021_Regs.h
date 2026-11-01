@@ -104,6 +104,7 @@ enum
     LR2021_RADIO_SET_DEFAULT_RX_TX_TIMEOUT_OC = 0x0215,
     LR2021_RADIO_SET_LORA_MODULATION_PARAM_OC = 0x0220,
     LR2021_RADIO_SET_LORA_PACKET_PARAMS_OC = 0x0221,
+    LR2021_RADIO_SET_LORA_SYNCWORD_OC = 0x0223,
     LR2021_RADIO_RESET_LORA_PACKET_STATUS_OC = 0x0228,
     LR2021_RADIO_GET_LORA_PACKET_STATUS_OC = 0x022A,
     LR2021_RADIO_SET_FSK_MODULATION_PARAMS_OC = 0x0240,
@@ -148,9 +149,18 @@ typedef enum
 
 typedef enum
 {
-    LR2021_RADIO_LORA_BW_62 = 0x03,  //!< Bandwidth 62.50 kHz
-    LR2021_RADIO_LORA_BW_500 = 0x06, //!< Bandwidth 500.00 kHz
-    LR2021_RADIO_LORA_BW_800 = 0x0F, //!< Bandwidth 812.00 kHz, 2G4 and compatible with LR112x chips only
+    LR2021_RADIO_LORA_BW_31   = 0x02, //!< Bandwidth 31.25 kHz
+    LR2021_RADIO_LORA_BW_62   = 0x03, //!< Bandwidth 62.50 kHz
+    LR2021_RADIO_LORA_BW_125  = 0x04, //!< Bandwidth 125.00 kHz
+    LR2021_RADIO_LORA_BW_250  = 0x05, //!< Bandwidth 250.00 kHz
+    LR2021_RADIO_LORA_BW_500  = 0x06, //!< Bandwidth 500.00 kHz
+    LR2021_RADIO_LORA_BW_1000 = 0x07, //!< Bandwidth 1000.00 kHz
+    LR2021_RADIO_LORA_BW_41   = 0x0A, //!< Bandwidth 41.67 kHz
+    LR2021_RADIO_LORA_BW_83   = 0x0B, //!< Bandwidth 83.33 kHz
+    LR2021_RADIO_LORA_BW_101  = 0x0C, //!< Bandwidth 101.56 kHz
+    LR2021_RADIO_LORA_BW_200  = 0x0D, //!< Bandwidth 203.125 kHz
+    LR2021_RADIO_LORA_BW_400  = 0x0E, //!< Bandwidth 406.25 kHz
+    LR2021_RADIO_LORA_BW_800  = 0x0F, //!< Bandwidth 812.50 kHz
 } lr20xx_radio_lora_bw_t;
 
 typedef enum

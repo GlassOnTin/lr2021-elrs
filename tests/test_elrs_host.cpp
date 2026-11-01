@@ -3,6 +3,7 @@
 
 #include "../firmware/elrs/elrs_protocol.h"
 #include "../firmware/crsf/crsf.h"
+#include "../firmware/rnode/rns_node.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -271,12 +272,203 @@ static void test_winniepico_live_packets(void) {
     printf("[PASS] test_winniepico_live_packets (TX16SMK3 SYNC + RCDATA, XR4 LINKSTATS)\n");
 }
 
+struct KissTestCtx {
+    uint8_t last_cmd;
+    uint8_t last_buf[RNODE_KISS_BUF_SIZE];
+    size_t  last_len;
+    int     frame_count;
+};
+
+static void on_test_kiss_frame(uint8_t cmd, const uint8_t *data, size_t len, void *user_ctx) {
+    KissTestCtx *ctx = (KissTestCtx *)user_ctx;
+    ctx->last_cmd = cmd;
+    ctx->last_len = len;
+    if (len > 0U && len <= sizeof(ctx->last_buf)) {
+        memcpy(ctx->last_buf, data, len);
+    }
+    ctx->frame_count++;
+}
+
+static void test_rnode_kiss_framing(void) {
+    KissTestCtx ctx = {};
+    rnode_kiss_parser_t parser;
+    rnode_kiss_init(&parser, on_test_kiss_frame, &ctx);
+
+    /* Payload containing FEND (0xC0) and FESC (0xDB) to verify byte-stuffing */
+    const uint8_t raw_payload[] = {0x08, 0x00, 0xC0, 0xDB, 0xDC, 0xDD, 0x42, 0xFF};
+    uint8_t frame[64];
+    size_t flen = rnode_kiss_build_frame(frame, sizeof(frame), RNODE_CMD_DATA, raw_payload, sizeof(raw_payload));
+    assert(flen == sizeof(raw_payload) + 3U + 2U); /* +3 FEND/CMD/FEND, +2 escaped bytes */
+
+    for (size_t i = 0; i < flen; i++) {
+        rnode_kiss_feed_byte(&parser, frame[i]);
+    }
+    assert(ctx.frame_count == 1);
+    assert(ctx.last_cmd == RNODE_CMD_DATA);
+    assert(ctx.last_len == sizeof(raw_payload));
+    assert(memcmp(ctx.last_buf, raw_payload, sizeof(raw_payload)) == 0);
+
+    /* Verify PHYPRM calculation for 868 MHz, BW=125 kHz, SF7, preamble=16 */
+    uint16_t slot_ms = 0, difs_ms = 0;
+    uint8_t phy_buf[12] = {0};
+    assert(rnode_build_phyprm(125000UL, 7U, 16U, &slot_ms, &difs_ms, phy_buf) == 12U);
+    assert(slot_ms == 2U); /* sym_us = 1024 us -> ceil = 2 ms */
+    assert(difs_ms == 6U);
+    printf("[PASS] test_rnode_kiss_framing (FEND/FESC escaping, CMD_DATA, CMD_STAT_PHYPRM)\n");
+}
+
+static void test_rns_relay_dedup_and_ifac(void) {
+    rns_relay_table_t relay;
+    rns_relay_init(&relay);
+
+    /* 1. Unmasked Reticulum packet (HEADER_1, PLAIN, DATA, hops=0) */
+    uint8_t pkt[32];
+    size_t len = rns_build_drone_command_pkt("RTL", pkt, sizeof(pkt));
+    assert(len == 22U);
+    assert(pkt[0] == 0x08U && pkt[1] == 0x00U);
+
+    /* First reception at t=1000ms: should forward and increment hops to 1 */
+    assert(rns_relay_should_forward(&relay, pkt, len, 1000UL));
+    assert(pkt[1] == 0x01U);
+    assert(relay.relayed_count == 1U);
+
+    /* Immediate echo of the relayed packet (with hops=1) at t=1200ms: must be dropped! */
+    assert(!rns_relay_should_forward(&relay, pkt, len, 1200UL));
+    assert(relay.dropped_dup_count == 1U);
+
+    /* After dedup window expires (t=12000ms > 1000 + 10000ms): allowed again */
+    assert(rns_relay_should_forward(&relay, pkt, len, 12000UL));
+    assert(pkt[1] == 0x02U);
+
+    /* 2. IFAC-protected Reticulum packet (bit 7 = 0x80 set): must NOT mutate byte 1 (hops) */
+    uint8_t ifac_pkt[28] = {0x88, 0x3A, 0x11, 0x22, 0x33, 0x44};
+    uint8_t orig_ifac[28];
+    memcpy(orig_ifac, ifac_pkt, sizeof(ifac_pkt));
+    assert(rns_relay_should_forward(&relay, ifac_pkt, sizeof(ifac_pkt), 2000UL));
+    assert(memcmp(ifac_pkt, orig_ifac, sizeof(ifac_pkt)) == 0);
+    assert(!rns_relay_should_forward(&relay, ifac_pkt, sizeof(ifac_pkt), 2500UL));
+    printf("[PASS] test_rns_relay_dedup_and_ifac (invariant hash ring, hop increment, IFAC preservation)\n");
+}
+
+static void test_fc_mavlink_and_beacons(void) {
+    rns_fc_telemetry_t tlm = {};
+    tlm.lat_deg_e7  = 515073509L; /* 51.50735 deg N */
+    tlm.lon_deg_e7  = -1277583L;  /* -0.12775 deg W */
+    tlm.rel_alt_mm  = 85000L;     /* 85 m AGL */
+    tlm.vbatt_mv    = 16800U;     /* 4S 16.8V */
+    tlm.custom_mode = 5U;         /* Loiter */
+    tlm.armed       = true;
+    tlm.has_gps_fix = true;
+
+    uint8_t bcn[255];
+    size_t blen = rns_build_telemetry_beacon(&tlm, 99U, -52, bcn, sizeof(bcn));
+    assert(blen > 19U);
+    assert(bcn[0] == 0x08U && bcn[1] == 0x00U);
+    assert(memcmp(&bcn[2], RNS_DEST_RNLOG_BEACON, 16U) == 0);
+    assert(strstr((const char *)&bcn[19], "\"lat\":51.50735") != NULL);
+    assert(strstr((const char *)&bcn[19], "\"lon\":-0.12775") != NULL);
+    assert(strstr((const char *)&bcn[19], "\"vbatt_mv\":16800") != NULL);
+
+    /* Verify Reticulum drone command packet round-trip & MAVLink v2 frame generation */
+    uint8_t cmd_pkt[64];
+    size_t clen = rns_build_drone_command_pkt("GOTO 515073509 -1277583 60", cmd_pkt, sizeof(cmd_pkt));
+    assert(clen > 19U);
+
+    rns_drone_cmd_t parsed = {};
+    assert(rns_parse_drone_command_pkt(cmd_pkt, clen, &parsed));
+    assert(parsed.type == RNS_DRONE_CMD_GUIDED_GOTO);
+    assert(parsed.lat_deg_e7 == 515073509L);
+    assert(parsed.lon_deg_e7 == -1277583L);
+    assert(parsed.alt_m == 60L);
+
+    uint8_t mav_frame[64];
+    size_t mlen = rns_build_mavlink_command(&parsed, 7U, mav_frame, sizeof(mav_frame));
+    assert(mlen == 49U); /* 10B header + 37B MISSION_ITEM_INT + 2B CRC */
+    assert(mav_frame[0] == 0xFDU && mav_frame[1] == 37U && mav_frame[7] == 73U);
+    printf("[PASS] test_fc_mavlink_and_beacons (rnlog.beacon, elrs.drone.cmd, MAVLink v2 MISSION_ITEM_INT)\n");
+}
+
+static void test_elrs_data_tunnel(void) {
+    uint8_t uid[6] = {0};
+    elrs_uid_from_bind_phrase("WinniePico", uid);
+    elrs_ota_state_t ota4, ota8;
+    elrs_ota_init(&ota4, uid, ELRS_OTA4_PACKET_SIZE, ELRS_SW_HYBRID_OR_16CH);
+    elrs_ota_init(&ota8, uid, ELRS_OTA8_PACKET_SIZE, ELRS_SW_HYBRID_OR_16CH);
+
+    /* Build a 110-byte Reticulum telemetry beacon packet */
+    rns_fc_telemetry_t tlm = {};
+    tlm.lat_deg_e7 = 515073509L;
+    tlm.lon_deg_e7 = -1277583L;
+    tlm.rel_alt_mm = 120000L;
+    tlm.vbatt_mv   = 24800U;
+    tlm.armed      = true;
+    uint8_t rns_pkt[255];
+    uint16_t rns_len = (uint16_t)rns_build_telemetry_beacon(&tlm, 100U, -48, rns_pkt, sizeof(rns_pkt));
+    assert(rns_len > 90U);
+
+    /* 1. Tunnel over OTA8 (13-byte 2G4_K1000 frames) with repeats=2 and simulated 30% packet loss */
+    elrs_data_tunnel_t tx8, rx8;
+    elrs_tunnel_init(&tx8, 2U);
+    elrs_tunnel_init(&rx8, 2U);
+    assert(elrs_tunnel_enqueue_tx(&tx8, rns_pkt, rns_len, true));
+
+    uint8_t out_msg[ELRS_TUNNEL_MAX_MTU] = {0};
+    uint16_t out_len = 0U;
+    bool completed = false;
+    int frame_idx = 0;
+    while (elrs_tunnel_has_pending_tx(&tx8)) {
+        uint8_t ota_pkt[13];
+        assert(elrs_tunnel_next_tx_frame(&tx8, &ota8, ota_pkt));
+        /* Verify OTA8 CRC16 is valid */
+        assert(elrs_ota_validate_crc(&ota8, ota_pkt, ota8.ota_nonce));
+
+        /* Drop every odd frame (50% loss — first copy of each fragment passes, second drops) */
+        if ((frame_idx % 2) == 0) {
+            if (elrs_tunnel_process_rx_frame(&rx8, ota_pkt, true, out_msg, &out_len)) {
+                completed = true;
+            }
+        }
+        frame_idx++;
+    }
+    assert(completed);
+    assert(out_len == rns_len);
+    assert(memcmp(out_msg, rns_pkt, rns_len) == 0);
+
+    /* 2. Tunnel over OTA4 (8-byte 900_200HZ / 900_K1000 frames) */
+    elrs_data_tunnel_t tx4, rx4;
+    elrs_tunnel_init(&tx4, 2U);
+    elrs_tunnel_init(&rx4, 2U);
+    assert(elrs_tunnel_enqueue_tx(&tx4, rns_pkt, rns_len, false));
+
+    memset(out_msg, 0, sizeof(out_msg));
+    out_len = 0U;
+    completed = false;
+    while (elrs_tunnel_has_pending_tx(&tx4)) {
+        uint8_t ota_pkt[8];
+        assert(elrs_tunnel_next_tx_frame(&tx4, &ota4, ota_pkt));
+        /* Verify OTA4 CRC14 is valid */
+        assert(elrs_ota_validate_crc(&ota4, ota_pkt, ota4.ota_nonce));
+
+        if (elrs_tunnel_process_rx_frame(&rx4, ota_pkt, false, out_msg, &out_len)) {
+            completed = true;
+        }
+    }
+    assert(completed);
+    assert(out_len == rns_len);
+    assert(memcmp(out_msg, rns_pkt, rns_len) == 0);
+    printf("[PASS] test_elrs_data_tunnel (OTA8 13B + OTA4 8B fragmentation/reassembly with loss recovery)\n");
+}
+
 int main(void) {
     test_uid_md5();
     test_fhss_invariants();
     test_ota4_and_ota8_roundtrip();
     test_crsf_framing();
     test_winniepico_live_packets();
+    test_rnode_kiss_framing();
+    test_rns_relay_dedup_and_ifac();
+    test_fc_mavlink_and_beacons();
+    test_elrs_data_tunnel();
     printf("All host unit tests PASSED.\n");
     return 0;
 }
