@@ -143,3 +143,29 @@ sequenceDiagram
     NodeA->>NodeB: Rebroadcast RNSF (hops=4)
     Note over NodeB: Compute Slot 5 (-30m N, -30m E), hops (4) >= max_hops (4) -> RNS_RELAY_EXPIRED
 ```
+
+### Combined Multi-Drone Command Bundles (`rns_multi`) & Hybrid `ELRS_RX` LoRa Bursts
+
+1. **Sending 4 Independent Drone Actions in One 64-Byte Packet (`RNSM`)**:
+   ```text
+   # Slot 1: 3D offset (-10m N, -15m E, +5m Alt) -> MAVLink #86 GLOBAL_POS_VEL
+   # Slot 2: NED velocity (+5 m/s N, -2 m/s E, 0 m/s D) -> MAVLink #84 VEL_NED
+   # Slot 3: LOITER -> MAVLink #76 COMMAND_LONG
+   # Slot 4: RTL -> MAVLink #76 COMMAND_LONG
+   rns_multi OFS:-10,-15,5 VEL:5,-2,0 LOITER RTL
+   ```
+2. **Single-Radio Lead Drone (`ELRS_RX`) Bridging 200 Hz FHSS to the 868 MHz LoRa Mesh**:
+   ```text
+   # On Lead Drone (/dev/ttyACM5, Slot 0): receive 200 Hz ELRS RC AND auto-broadcast Vee formation every 450 ms over 868 MHz LoRa bursts
+   rnode_cfg 868000000 500000 7 5
+   rns_slot 0
+   domain eu868
+   rate 900_200HZ
+   mode rx
+   rns_form auto vee 12.0 450 4.0 0.0
+
+   # On Wingman 1 (/dev/ttyACM7, Slot 1): receive 868 MHz LoRa bursts and relay in Slot 1 TDMA window
+   rnode_cfg 868000000 500000 7 5
+   rns_slot 1
+   mode relay
+   ```
