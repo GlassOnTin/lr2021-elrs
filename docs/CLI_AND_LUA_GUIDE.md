@@ -60,6 +60,30 @@ Copy [`tools/rns_elrs.lua`](../tools/rns_elrs.lua) to `/SCRIPTS/TOOLS/rns_elrs.l
 2. **Over-the-Air Receiver (`[OTA-RX(0xEC)]`)**: Tunnels CRSF `0x7A` commands over the ExpressLRS FHSS link directly to a bound LR2021 receiver (`ELRS_RX`) and returns `0x7B` responses over telemetry slots.
 3. **RC Switch Trigger (`CH11` / `AUX7`)**: Flipping `CH11` high on any bound handset triggers the receiver to broadcast a signed `RNSA` announce and send a CRSF `0x21` `FLIGHT_MODE` string (`RNS:4cef..c149 1p`) to the handset telemetry screen.
 
+```mermaid
+flowchart LR
+    subgraph Handset["EdgeTX Handset (TX16S / Boxer / Pocket)"]
+        LUA["tools/rns_elrs.lua (Pages 1..4)"]
+        SW["CH11 / AUX7 Switch (>1700 us)"]
+        FM["Native Telemetry Screen (0x21 FLIGHT_MODE)"]
+    end
+
+    subgraph Bay["Transmitter Bay"]
+        TXMOD["TX Module (0xEE)"]
+    end
+
+    subgraph Drone["Airborne LR2021 Receiver (0xEC)"]
+        RXMOD["ELRS_RX + Reticulum Node"]
+        FC["ArduPilot FC (MAVLink v2)"]
+    end
+
+    LUA <-->|"Path 1: CRSF 0x7A / 0x7B (Dest 0xEE)"| TXMOD
+    LUA <-->|"Path 2: OTA CRSF 0x7A / 0x7B Tunnel (Dest 0xEC)"| RXMOD
+    SW -->|"Path 3: RCDATA CH11 Edge"| RXMOD
+    RXMOD -->|"0x21 'RNS:4cef..c149 1p'"| FM
+    RXMOD -->|"RNSC / RNSF -> MAVLink v2"| FC
+```
+
 ### Pages
 
 - **Page 1 (Identity & Pairing)**: Shows `tx_dest`, `rx_dest`, link lock, peer count, ping RTT, and native `0x21` flight mode text. Includes `[Pair & Sync RX]`, `[Announce]`, and target toggle (`0xEE` vs `0xEC`).
@@ -100,3 +124,21 @@ rns_form vee 10.0 5.0 0.0 0.0
 ```
 
 The packet bounces between Node B and Node A (`hops = 0 -> 1 -> 2 -> 3 -> 4`) with a `120 ms` turn-around delay at each hop, computing formation slots `1..5` along the chain, and expires on Node B when `hops == 4` (`RNS_RELAY_EXPIRED hops=4 max_hops=4 ttl_ms=3000`) or when `ttl_ms` elapses. Run `rns_chain off` to return to normal deduplicating relay mode.
+
+```mermaid
+sequenceDiagram
+    participant NodeA as Node A (/dev/ttyACM5)
+    participant NodeB as Node B (/dev/ttyACM7)
+
+    Note over NodeA,NodeB: Both configured with: rns_chain 4 120 3000 (max_hops=4, delay=120ms, ttl=3000ms)
+    NodeA->>NodeB: RNSF Vee Packet (hops=0)
+    Note over NodeB: Compute Slot 1 (-10m N, -10m E), wait 120 ms, increment hops=1
+    NodeB->>NodeA: Rebroadcast RNSF (hops=1)
+    Note over NodeA: Compute Slot 2 (-10m N, +10m E), wait 120 ms, increment hops=2
+    NodeA->>NodeB: Rebroadcast RNSF (hops=2)
+    Note over NodeB: Compute Slot 3 (-20m N, -20m E), wait 120 ms, increment hops=3
+    NodeB->>NodeA: Rebroadcast RNSF (hops=3)
+    Note over NodeA: Compute Slot 4 (-20m N, +20m E), wait 120 ms, increment hops=4
+    NodeA->>NodeB: Rebroadcast RNSF (hops=4)
+    Note over NodeB: Compute Slot 5 (-30m N, -30m E), hops (4) >= max_hops (4) -> RNS_RELAY_EXPIRED
+```

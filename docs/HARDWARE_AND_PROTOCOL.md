@@ -6,6 +6,42 @@ This document covers the hardware interface on the [Seeed Studio Semtech LR2021 
 
 ## 1. Hardware Architecture (`XIAO nRF54L15` + `Wio-LR2021`)
 
+```mermaid
+flowchart LR
+    subgraph Host["External Interfaces"]
+        USB["USB-C Host (rnsd / CLI / OpenOCD)"]
+        GROVE["Grove UART D6/D7 (ArduPilot FC / Handset)"]
+    end
+
+    subgraph XIAO["Seeed Studio XIAO nRF54L15 (Cortex-M33 @ 128 MHz)"]
+        SAMD["SAMD11 Bridge (CMSIS-DAP + CDC)"]
+        UARTE22["UARTE22 (P1.08/P1.09 @ 115200)"]
+        UARTE21["UARTE21 (P2.07/P2.08 @ 420k/115.2k)"]
+        TIMER10["TIMER10 (32 MHz / 32 = 1 MHz Clock)"]
+        TIMER20["TIMER20 (16 MHz / 16 = 1 MHz FHSS Tick/Tock)"]
+        SPIM00["SPIM00 (P2.01..P2.04 @ 8 MHz + NSS/RST/BUSY)"]
+        GPIOTE20["GPIOTE20 (P1.04 Rising-Edge IRQ)"]
+    end
+
+    subgraph WIO["Seeed Studio Wio-LR2021 (Semtech LR2021 Rev B 0x0118)"]
+        XOSC["32 MHz Passive XOSC (No TCXO 0x0120)"]
+        MODEM["LoRa / FLRC / GFSK Baseband + PRAM"]
+        RFSW["DIO5..DIO7 RF Switch Matrix"]
+        ANT_LF["ANT_LF SMA (Sub-GHz 868/915 MHz)"]
+        ANT_HF["ANT_HF SMA (2.4 GHz ISM)"]
+    end
+
+    USB <--> SAMD
+    SAMD <--> UARTE22
+    GROVE <--> UARTE21
+    SPIM00 <-->|"8 MHz Full-Duplex SPI"| MODEM
+    MODEM -->|"DIO8 (RX_DONE / TX_DONE)"| GPIOTE20
+    XOSC --> MODEM
+    MODEM --> RFSW
+    RFSW --> ANT_LF
+    RFSW --> ANT_HF
+```
+
 ### 1.0 Pin Mapping & RF Limits
 
 - **Evaluation Kit**: [Seeed Studio Semtech LR2021 LoRa Plus Evaluation Kit (868 MHz EU)](https://www.seeedstudio.com/LR2021-LoRa-Plus-Evaluation-kit-868Mhz-EU-V2-0-p-6697.html) / [915 MHz US](https://www.seeedstudio.com/LR2021-LoRa-Plus-Evaluation-kit-915Mhz-US-V2-0-p-6698.html) ([Seeed Wiki](https://wiki.seeedstudio.com/semtech_lr2021_evk_getting_started/))
@@ -64,17 +100,23 @@ The `Wio-LR2021` module on the Seeed EVK uses two hardware configurations that d
 
 ### 2.1 System Topologies
 
-The firmware supports two complementary architectures for Reticulum drone communications:
+The firmware supports two complementary architectures for Reticulum drone communications, plus cross-link forwarding between the ExpressLRS FHSS tunnel and the LoRa store-and-forward relay:
 
-```text
-Topology A: Dedicated 868 MHz / 2.4 GHz LoRa RNode + Airborne Store-and-Forward Relay
-[Host rnsd / NomadNet] <--USB KISS--> [EVK #1: RNODE Mode] ~~~867.2 MHz LoRa~~~> [EVK #2 on Drone: RELAY Mode]
-                                                                                       |--> Repeats RNS Mesh Packets (IFAC-safe)
-                                                                                       |<-> UART MAVLink v2 to TMotorH743 FC
+```mermaid
+flowchart TD
+    subgraph TopoA["Topology A: Dedicated RNode + Airborne Store-and-Forward Relay"]
+        HOST["Host rnsd / Sideband / NomadNet"] <-->|"USB KISS (FEND 0xC0, MTU 508B)"| RNODE["EVK #1: RNODE Mode"]
+        RNODE <-->|"868 MHz / 2.4 GHz Explicit-Header LoRa"| RELAY["EVK #2 on Drone: RELAY Mode"]
+        RELAY -->|"64-Entry FNV-1a Dedup + IFAC-Safe Rebroadcast"| MESH["Downstream Follower Drones (Slots 1..7)"]
+        RELAY <-->|"Grove UART MAVLink v2 (#0, #1, #33 / #70, #73, #76, #84, #86)"| FC_A["ArduPilot Flight Controller"]
+    end
 
-Topology B: Reticulum-over-ExpressLRS FHSS Tunnel (Single RF Link for RC + Reticulum)
-[Ground Station] --> [EVK #1: ELRS_TX] ~~~868 MHz / 2.4 GHz ELRS FHSS~~~> [EVK #2: ELRS_RX] <--> [TMotorH743 FC]
-                      (Multiplexes RCDATA + ELRS_PKT_TYPE_DATA fragments)   (Outputs 420k CRSF RC + MAVLink v2 commands)
+    subgraph TopoB["Topology B: Reticulum-over-ExpressLRS FHSS Tunnel"]
+        GS["Ground Station / EdgeTX Handset"] -->|"CRSF / CLI"| ELRS_TX["EVK #1: ELRS_TX Mode"]
+        ELRS_TX <-->|"FHSS: Even Nonces = RCDATA/SYNC, Odd Nonces = DATA Tunnel"| ELRS_RX["EVK #2: ELRS_RX Mode"]
+        ELRS_RX -->|"420k CRSF RC (0x16) + Link Stats (0x14)"| FC_B["ArduPilot Flight Controller"]
+        ELRS_RX -->|"Reassembled RNS Packet -> MAVLink v2 / Relay"| FC_B
+    end
 ```
 
 ### 2.2 RNode KISS Protocol (`RNODE` Mode)
@@ -107,6 +149,24 @@ When operating in `RELAY` mode on the drone:
   - `rns_build_formation_pkt()` packs `[0..18]` Reticulum header (`0x08`, `hops`, `RNS_DEST_DRONE_CMD`, `0xA7`), `[19..22]` `"RNSF"`, `[23..38]` `leader_dest` (16B), `[39]` `seq`, `[40]` `shape` (`HOLD = 0`, `LINE = 1`, `VEE = 2`, `COLUMN = 3`), `[41..42]` `spacing_dm`, `[43..46]` `leader_lat_e7`, `[47..50]` `leader_lon_e7`, `[51..52]` `leader_alt_dm`, `[53..54]` `vx_cms`, `[55..56]` `vy_cms`, `[57..58]` `vz_cms`, `[59..60]` `heading_cdeg`, and `[62..63]` 2-byte SHA-256 tag over bytes `[2..61]`.
   - Followers compute their rotated slot offset via `rns_compute_formation_slot_cmd()` and emit a 65-byte MAVLink v2 `SET_POSITION_TARGET_GLOBAL_INT` (`msgid = 86`, `CRC_EXTRA = 5`, `mask = 0x09C0`, `frame = GLOBAL_RELATIVE_ALT_INT (6)`). A 3.0 s dead-man watchdog (`RNS_MESH_WATCHDOG_MS = 3000`) emits `MAV_CMD_NAV_LOITER_UNLIM` if updates stop.
 
+```mermaid
+sequenceDiagram
+    participant LFC as Leader FC (ArduPilot)
+    participant LNode as Leader Node (Slot 0)
+    participant W1Node as Wingman 1 Node (Slot 1)
+    participant W1FC as Wingman 1 FC
+    participant W2Node as Wingman 2 Node (Slot 2)
+
+    LFC->>LNode: MAVLink #33 GLOBAL_POSITION_INT (lat, lon, alt, vn, ve, hdg)
+    LNode->>W1Node: 64B RNSF Packet (shape=VEE, spacing=10m, hops=0, SHA-256 tag)
+    Note over W1Node: Verify SHA-256 tag & FNV-1a dedup, compute Slot 1 (-10m N, -10m E) + Vel Feed-Forward
+    W1Node->>W1FC: 65B MAVLink v2 #86 SET_POSITION_TARGET_GLOBAL_INT
+    W1Node->>W2Node: Rebroadcast 64B RNSF (hops=1, jittered slot delay)
+    Note over W2Node: Compute Slot 2 (-10m N, +10m E) -> MAVLink #86
+    Note over W1Node,W1FC: If no RNSF/VEL arrives within 3000 ms (RNS_MESH_WATCHDOG_MS):
+    W1Node->>W1FC: 45B MAVLink v2 #76 COMMAND_LONG (MAV_CMD_NAV_LOITER_UNLIM)
+```
+
 ### 2.5 ExpressLRS `ELRS_PKT_TYPE_DATA` (`0x01`) FHSS Tunnel
 
 To carry Reticulum packets up to 500 bytes across an active ExpressLRS link without a second radio:
@@ -119,6 +179,23 @@ To carry Reticulum packets up to 500 bytes across an active ExpressLRS link with
 
 ## 3. ExpressLRS Protocol Implementation
 
+```mermaid
+stateDiagram-v2
+    [*] --> IDLE
+    IDLE --> RNODE: mode rnode / 0xC0 KISS FEND
+    IDLE --> RELAY: mode relay
+    IDLE --> ELRS_TX: mode tx
+    IDLE --> ELRS_RX: mode rx
+
+    state ELRS_RX {
+        [*] --> DISCONNECTED
+        DISCONNECTED --> TENTATIVE: SYNC Packet CRC Match (Sync OtaNonce & FHSS Index)
+        TENTATIVE --> CONNECTED: Valid Packet on Next FHSS Hop (TIMER20 Phase-Locked)
+        TENTATIVE --> DISCONNECTED: Hop Timeout
+        CONNECTED --> DISCONNECTED: LQ / Sync Timeout
+    }
+```
+
 ### 3.1 UID Derivation and CRC Seeds
 
 Binding phrases are hashed with MD5 following the ExpressLRS algorithm (`elrs_uid_from_bind_phrase()` in `firmware/elrs/elrs_protocol.cpp`):
@@ -127,9 +204,9 @@ Binding phrases are hashed with MD5 following the ExpressLRS algorithm (`elrs_ui
 MD5("-DMY_BINDING_PHRASE=\"" + phrase + "\"") -> first 6 bytes = UID[0..5]
 ```
 
-For `"lr2021-elrs-demo"`, `UID = 0A:B7:0C:7C:38:03`:
-- **`OtaCrcInitializer` (16-bit):** `((UID[4] << 8) | UID[5]) ^ (OTA_VERSION_ID << 8)`
-- **`FHSSrandomisr` Seed (32-bit):** `((UID[2] << 24) | (UID[3] << 16) | (UID[4] << 8) | (UID[5] ^ OTA_VERSION_ID)) & 0x7FFFFFFF`
+For `"lr2021-elrs-demo"`, `UID = 6C:40:CF:45:F5:08`:
+- **`OtaCrcInitializer` (16-bit):** `((UID[4] << 8) | UID[5]) ^ (OTA_VERSION_ID << 8)` (`0xF108`)
+- **`FHSSrandomisr` Seed (32-bit):** `((UID[2] << 24) | (UID[3] << 16) | (UID[4] << 8) | (UID[5] ^ OTA_VERSION_ID)) & 0x7FFFFFFF` (`0x4F45F50C` masked / `0xCF45F50C` raw)
 
 ### 3.2 Hamming(7,4) FEC & Bit Interleaver (`2G4_K1000` / `900_K1000`)
 

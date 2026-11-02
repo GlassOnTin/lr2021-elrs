@@ -8,6 +8,41 @@ The firmware combines **ExpressLRS v3/v4 RC control** with **Reticulum (`rnsd`) 
 
 ## What to Expect
 
+```mermaid
+flowchart LR
+    subgraph Ground["Ground Station & Pilot"]
+        RNS["Reticulum Host (rnsd / Sideband / NomadNet)"]
+        TX["EdgeTX Handset (tools/rns_elrs.lua)"]
+    end
+
+    subgraph Board1["LR2021 EVK #1 (Ground)"]
+        KISS["RNODE Mode (USB-C KISS TNC)"]
+        ELRSTX["ELRS_TX Mode (FHSS RC + DATA Tunnel)"]
+    end
+
+    subgraph Drone0["Leader Drone (Slot 0)"]
+        RX0["LR2021 EVK #2 (ELRS_RX / RELAY)"]
+        FC0["ArduPilot FC (CRSF 420k + MAVLink v2)"]
+        RX0 <-->|"Grove UART (D6/D7)"| FC0
+    end
+
+    subgraph Swarm["Multi-Hop Follower Drones (Slots 1..7)"]
+        RX1["Wingman 1 (RELAY Slot 1)"]
+        FC1["ArduPilot FC (#86 Pos+Vel)"]
+        RX2["Wingman 2 (RELAY Slot 2)"]
+        FC2["ArduPilot FC (#86 Pos+Vel)"]
+        RX1 <-->|"MAVLink v2"| FC1
+        RX2 <-->|"MAVLink v2"| FC2
+    end
+
+    RNS <-->|"USB-C 115200"| KISS
+    TX <-->|"CRSF 0x7A/0x7B"| ELRSTX
+    KISS <-->|"868 MHz / 2.4 GHz LoRa"| RX0
+    ELRSTX <-->|"FHSS RCDATA + RNS Tunnel"| RX0
+    RX0 <-->|"RNSF 64B Formation / Relay (hops=0..N)"| RX1
+    RX1 <-->|"Store-and-Forward Relay (hops++)"| RX2
+```
+
 ### What Works Today
 - **ExpressLRS RC & Telemetry (`ELRS_TX`, `ELRS_RX`, `MONITOR`)**: 23 air rates across Sub-GHz (`EU868`, `FCC915`, `AU915`) and 2.4 GHz (`CE_LBT`, `ISM2G4`) using LoRa, FLRC, and GFSK + Hamming(7,4) FEC. Outputs 420,000-baud CRSF `RC_CHANNELS_PACKED` (`0x16`) and `LINK_STATISTICS` (`0x14`) on the Grove UART (`D6`/`D7`).
 - **Plug-and-Play Reticulum RNode (`RNODE`)**: Standard RNode KISS TNC over USB-C (`115200 8N1`) for Reticulum (`RNodeInterface`), Sideband, and NomadNet. Supports transparent multi-frame fragmentation up to `RNODE_HW_MTU = 508` bytes.
