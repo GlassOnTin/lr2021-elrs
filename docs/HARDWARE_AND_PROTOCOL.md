@@ -219,3 +219,28 @@ In `2G4_K1000` and `900_K1000`, the 8-byte payload of an 8-byte `OTA4` frame ove
 1. The low and high nibbles of each byte (`n0..n15`) map through `k_hamming_enc[16]` into sixteen 7-bit codewords.
 2. Bits `0..6` across groups of 8 codewords transpose into 14 interleaved air bytes. A burst error of up to 8 consecutive air bits flips at most 1 bit in any single 7-bit codeword.
 3. On receive, `fec_decode_14_to_8()` de-interleaves the 14 air bytes and corrects single-bit errors per codeword via `k_hamming_dec[128]`.
+
+---
+
+## 9. RadioMaster XR4 (`ESP32-PICO-D4 + 2× Semtech LR1121`) Dual-Radio Target
+
+The repository also builds a unified firmware target (`pio run -e radiomaster_xr4` via [`platformio.ini`](../platformio.ini)) for the **RadioMaster XR4** dual-band receiver ([`firmware/radio/lr1121_driver.h`](../firmware/radio/lr1121_driver.h), [`firmware/radio/lr1121_driver.cpp`](../firmware/radio/lr1121_driver.cpp), and [`firmware/src/xr4_main.cpp`](../firmware/src/xr4_main.cpp)).
+
+| Function | ESP32-PICO-D4 GPIO | Notes |
+|---|---|---|
+| Shared SPI (`SCK / MISO / MOSI`) | `GPIO 25 / 33 / 32` | 16 MHz `SPI_MODE0` |
+| **Radio 1 (`LR1121 #1`: `NSS / RST / BUSY / DIO1`)** | `GPIO 27 / 26 / 36 / 37` | Full-time 2.4 GHz `2G4_K1000` (or Sub-GHz) ExpressLRS (`HF_PA` / `HP_PA`) |
+| **Radio 2 (`LR1121 #2`: `NSS / RST / BUSY / DIO1`)** | `GPIO 13 / 21 / 39 / 34` | Full-time 868 MHz Reticulum LoRa Mesh (`RNODE` / `RELAY` / `RNSF` / `RNSM`) |
+| `DIO5..DIO8` RF Switch Matrix (`0x0112`) | `{15, 0, 12, 8, 8, 6, 0, 5}` | Matches official `radiomaster.rx_dual.xr4` overlay |
+| Primary CRSF (`UART0 RX / TX`) | `GPIO 3 / 1` | `420,000` baud CRSF (`0x16` RC + `0x14` LinkStats + `0x32 'b' 'l'` bootloader entry) |
+| Auxiliary (`UART1 RX / TX`, `X1/X2` pads) | `GPIO 5 / 18` | `115,200` baud MAVLink v2 output (`#70/#73/#76/#84/#86`) + telemetry ingest + CLI |
+
+```mermaid
+flowchart LR
+    TX16S["TX16S MK3 Handset<br/>2.4 GHz 2G4_K1000"] ==>|"Continuous 1000 Hz<br/>RC + DATA Tunnel"| R1["XR4 Radio 1 (LR1121 #1)<br/>NSS=27 DIO1=37 (2.4 GHz)"]
+    R1 -->|"420k CRSF (0x16)"| FC0["Flight Controller UART<br/>GPIO 3/1"]
+    R1 -->|"64B RNSM / RNSF / RNSC<br/>Zero Time-Slicing"| COORD["xr4_dual_radio_t<br/>Coordinator (ESP32)"]
+    COORD -->|"MAVLink v2 (#86/#84/#76)"| AUX["X1/X2 Aux UART<br/>GPIO 5/18"]
+    COORD ==>|"Immediate 868 MHz TX<br/>+ 45 ms Slot-TDMA"| R2["XR4 Radio 2 (LR1121 #2)<br/>NSS=13 DIO1=34 (868 MHz)"]
+    R2 <==>|"868 MHz LoRa Mesh"| SWARM["Wingman Nodes<br/>(Slots 1..4)"]
+```

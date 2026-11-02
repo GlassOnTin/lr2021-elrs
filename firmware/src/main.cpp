@@ -425,25 +425,26 @@ static void start_elrs_lora_mesh_burst(const uint8_t *pkt, uint8_t len) {
 }
 
 static void restore_elrs_rx_after_lora_burst(void) {
-    g_elrs_lora_burst_active = false;
-    g_elrs_lora_burst_done   = false;
     const elrs_air_rate_config_t *rate = elrs_get_air_rate_by_index(g_rate_idx);
     if (rate == NULL) {
+        g_elrs_lora_burst_done   = false;
+        g_elrs_lora_burst_active = false;
         return;
     }
     bool rate_is_2g4 = (rate->phy_type == ELRS_PHY_LORA_2G4 ||
                         rate->phy_type == ELRS_PHY_FLRC_2G4 ||
                         rate->phy_type == ELRS_PHY_FSK_2G4);
-    uint32_t curr_freq = (g_lock_state == LOCK_DISCONNECTED)
-                             ? elrs_fhss_get_initial_freq(&g_fhss)
-                             : elrs_fhss_get_curr_freq(&g_fhss);
+    uint32_t init_freq = elrs_fhss_get_initial_freq(&g_fhss);
     bool invert_iq = (g_ota.uid[5] & 0x01U) != 0U;
 
+    /* Keep g_elrs_lora_burst_active == true while reconfiguring LR2021 so
+     * TIMER20 (1000 Hz) advances OtaNonce/FHSS in RAM without touching SPI.
+     */
     if (rate->phy_type == ELRS_PHY_LORA_900 || rate->phy_type == ELRS_PHY_LORA_2G4) {
         lr2021_config_lora(rate->bw,
                            rate->sf,
                            rate->cr,
-                           curr_freq,
+                           init_freq,
                            rate->preamble_len,
                            invert_iq,
                            rate->payload_len,
@@ -453,7 +454,7 @@ static void restore_elrs_rx_after_lora_burst(void) {
         lr2021_config_flrc(rate->bw,
                            rate->cr,
                            rate->sf,
-                           curr_freq,
+                           init_freq,
                            rate->preamble_len,
                            g_ota.uid_seed,
                            g_ota.crc_init,
@@ -465,7 +466,7 @@ static void restore_elrs_rx_after_lora_burst(void) {
         lr2021_config_fsk(bitrate,
                           rate->sf,
                           fdev,
-                          curr_freq,
+                          init_freq,
                           rate->preamble_len,
                           g_ota.uid[5],
                           g_ota.uid[4],
@@ -473,7 +474,14 @@ static void restore_elrs_rx_after_lora_burst(void) {
                           use_fec);
     }
     lr2021_set_tx_power_dbm(g_tx_power_dbm, !rate_is_2g4);
-    lr2021_rx_nb();
+
+    /* Snap to the latest FHSS frequency after config completes, then release TIMER20 */
+    uint32_t curr_freq = (g_lock_state == LOCK_DISCONNECTED)
+                             ? init_freq
+                             : elrs_fhss_get_curr_freq(&g_fhss);
+    lr2021_set_frequency(curr_freq, true);
+    g_elrs_lora_burst_done   = false;
+    g_elrs_lora_burst_active = false;
 }
 
 /* ============================================================================

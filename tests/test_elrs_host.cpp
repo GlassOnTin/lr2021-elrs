@@ -4,6 +4,7 @@
 #include "../firmware/elrs/elrs_protocol.h"
 #include "../firmware/crsf/crsf.h"
 #include "../firmware/rnode/rns_node.h"
+#include "../firmware/radio/lr1121_driver.h"
 
 #include <assert.h>
 #include <dlfcn.h>
@@ -1412,6 +1413,207 @@ static void test_slot_tdma_and_multi_drone_bundle(void) {
     printf("[PASS] test_slot_tdma_and_multi_drone_bundle (Deterministic Slot-TDMA + 64B RNSM multi-slot bundle)\n");
 }
 
+struct MockLr1121State {
+    uint32_t resets[2];
+    uint8_t  rfsw_cfg[2][8];
+    uint8_t  pkt_type[2];
+    uint32_t freq_hz[2];
+    uint8_t  pa_sel[2];
+    uint8_t  last_tx_buf[2][255];
+    uint16_t last_tx_len[2];
+    uint8_t  mock_rx_buf[2][255];
+    uint8_t  mock_rx_len[2];
+};
+
+static MockLr1121State g_mock_lr1121;
+
+static void mock_lr1121_reset(lr1121_radio_idx_t r) {
+    g_mock_lr1121.resets[r]++;
+}
+
+static bool mock_lr1121_wait_busy(lr1121_radio_idx_t r, uint32_t timeout_us) {
+    (void)r;
+    (void)timeout_us;
+    return true;
+}
+
+static void mock_lr1121_write_cmd(lr1121_radio_idx_t r, uint16_t opcode, const uint8_t *params, uint16_t len) {
+    if (opcode == LR1121_OC_SET_DIO_AS_RF_SWITCH && len == 8U) {
+        memcpy(g_mock_lr1121.rfsw_cfg[r], params, 8U);
+    } else if (opcode == LR1121_OC_SET_PKT_TYPE && len == 1U) {
+        g_mock_lr1121.pkt_type[r] = params[0];
+    } else if (opcode == LR1121_OC_SET_RF_FREQUENCY && len == 4U) {
+        g_mock_lr1121.freq_hz[r] = ((uint32_t)params[0] << 24U) |
+                                   ((uint32_t)params[1] << 16U) |
+                                   ((uint32_t)params[2] << 8U)  |
+                                   ((uint32_t)params[3]);
+    } else if (opcode == LR1121_OC_SET_PA_CFG && len == 4U) {
+        g_mock_lr1121.pa_sel[r] = params[0];
+    } else if (opcode == LR1121_OC_WRITE_BUFFER8 && len <= 255U) {
+        memcpy(g_mock_lr1121.last_tx_buf[r], params, len);
+        g_mock_lr1121.last_tx_len[r] = len;
+    }
+}
+
+static void mock_lr1121_read_cmd(lr1121_radio_idx_t r,
+                                 uint16_t opcode,
+                                 const uint8_t *args,
+                                 uint16_t arg_len,
+                                 uint8_t *out,
+                                 uint16_t out_len) {
+    (void)args;
+    (void)arg_len;
+    memset(out, 0, out_len);
+    if (opcode == LR1121_OC_GET_VERSION && out_len >= 5U) {
+        out[1] = 0x22U; /* HW version */
+        out[2] = 0xF3U; /* LR1121 chip type */
+        out[3] = 0x01U;
+        out[4] = 0x02U;
+    } else if (opcode == LR1121_OC_GET_RXBUFFER_STATUS && out_len >= 3U) {
+        out[1] = g_mock_lr1121.mock_rx_len[r];
+        out[2] = 0U;
+    } else if (opcode == LR1121_OC_READ_BUFFER8 && out_len >= (uint16_t)(g_mock_lr1121.mock_rx_len[r] + 1U)) {
+        memcpy(&out[1], g_mock_lr1121.mock_rx_buf[r], g_mock_lr1121.mock_rx_len[r]);
+    } else if (opcode == LR1121_OC_GET_PKT_STATUS && out_len >= 4U) {
+        out[1] = 80U; /* -40 dBm */
+        out[2] = 48U; /* +12.0 dB SNR */
+    }
+}
+
+static void test_xr4_lr1121_dual_radio_and_bridge(void) {
+    memset(&g_mock_lr1121, 0, sizeof(g_mock_lr1121));
+    const lr1121_hal_ops_t mock_ops = {
+        .reset_radio = mock_lr1121_reset,
+        .wait_busy   = mock_lr1121_wait_busy,
+        .write_cmd   = mock_lr1121_write_cmd,
+        .read_cmd    = mock_lr1121_read_cmd,
+    };
+    lr1121_set_hal_ops(&mock_ops);
+
+    xr4_dual_radio_t xr4_lead;
+    const uint8_t hw_id1[8] = {0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x01};
+    assert(xr4_dual_radio_init(&xr4_lead,
+                               "WinniePico",
+                               ELRS_DOMAIN_CE2G4,
+                               13U,
+                               868000000UL,
+                               500000UL,
+                               7U,
+                               LR1121_LORA_CR_4_5,
+                               14,
+                               1U, /* Drone Slot 1 */
+                               hw_id1));
+
+    /* Verify Radio 1 (2.4 GHz GFSK + HF PA) and Radio 2 (868 MHz LoRa + HP PA) hardware setup */
+    assert(g_mock_lr1121.resets[LR1121_RADIO_1] == 1U);
+    assert(g_mock_lr1121.resets[LR1121_RADIO_2] == 1U);
+    assert(memcmp(g_mock_lr1121.rfsw_cfg[LR1121_RADIO_1], k_xr4_rfsw_ctrl, 8U) == 0);
+    assert(memcmp(g_mock_lr1121.rfsw_cfg[LR1121_RADIO_2], k_xr4_rfsw_ctrl, 8U) == 0);
+    assert(g_mock_lr1121.pkt_type[LR1121_RADIO_1] == LR1121_PKT_TYPE_GFSK);
+    assert(g_mock_lr1121.pkt_type[LR1121_RADIO_2] == LR1121_PKT_TYPE_LORA);
+    assert(g_mock_lr1121.pa_sel[LR1121_RADIO_1]   == LR1121_PA_SEL_HF);
+    assert(g_mock_lr1121.pa_sel[LR1121_RADIO_2]   == LR1121_PA_SEL_HP);
+    assert(g_mock_lr1121.freq_hz[LR1121_RADIO_1]  >= 2400000000UL);
+    assert(g_mock_lr1121.freq_hz[LR1121_RADIO_2]  == 868000000UL);
+
+    /* Verify 8B -> 14B -> 8B Hamming(7,4) FEC roundtrip with single-bit error correction on Radio 1 */
+    uint8_t sync8[8] = {0};
+    elrs_sync_data_t sd = {
+        .fhss_index      = 5,
+        .nonce           = 20,
+        .rf_rate_enum    = ELRS_RATE_FSK_2G4_1000HZ,
+        .switch_enc_mode = ELRS_SW_HYBRID_OR_16CH,
+        .new_tlm_ratio   = 6,
+        .gemini_mode     = 1,
+        .ota_protocol    = 0,
+        .uid4            = xr4_lead.uid[4],
+        .uid5            = xr4_lead.uid[5],
+    };
+    elrs_ota_pack_sync(&xr4_lead.ota, &sd, sync8);
+    lr1121_tx_nb(LR1121_RADIO_1, sync8, 8U);
+    assert(g_mock_lr1121.last_tx_len[LR1121_RADIO_1] == 14U);
+
+    memcpy(g_mock_lr1121.mock_rx_buf[LR1121_RADIO_1], g_mock_lr1121.last_tx_buf[LR1121_RADIO_1], 14U);
+    g_mock_lr1121.mock_rx_buf[LR1121_RADIO_1][3] ^= 0x04U; /* Inject 1-bit RF error */
+    g_mock_lr1121.mock_rx_len[LR1121_RADIO_1] = 14U;
+
+    uint8_t rx_sync8[8] = {0};
+    lr1121_pkt_stats_t st = {0, 0, 0};
+    assert(lr1121_rx_read(LR1121_RADIO_1, rx_sync8, sizeof(rx_sync8), &st));
+    assert(memcmp(rx_sync8, sync8, 8U) == 0);
+    assert(xr4_dual_radio_on_elrs_rx(&xr4_lead, rx_sync8, st.rssi_dbm, st.snr_q2_db, 1000UL));
+    assert(xr4_lead.elrs_locked);
+
+    /* Build a 64-byte RNSM 4-drone command bundle and tunnel it over Radio 1 (2.4 GHz ELRS DATA frames) */
+    rns_multi_drone_pkt_t mp;
+    memset(&mp, 0, sizeof(mp));
+    mp.seq          = 99U;
+    mp.slot_mask    = 0x0FU;
+    mp.ref_lat_e7   = -353632620;
+    mp.ref_lon_e7   = 1491652370;
+    mp.ref_alt_mm   = 30000;
+    mp.heading_cdeg = 0U;
+    mp.slots[0]     = {RNS_MULTI_ACT_OFFSET_NED, -100, -150, 5}; /* Slot 1: -10m N, -15m E, +5m Alt */
+    mp.slots[1]     = {RNS_MULTI_ACT_VEL_NED, 60, -20, 0};       /* Slot 2: +6.0m/s N, -2.0m/s E */
+    mp.slots[2]     = {RNS_MULTI_ACT_LOITER, 0, 0, 0};           /* Slot 3: LOITER */
+    mp.slots[3]     = {RNS_MULTI_ACT_RTL, 0, 0, 0};              /* Slot 4: RTL */
+
+    uint8_t rnsm_raw[64] = {0};
+    assert(rns_build_multi_drone_pkt(&mp, rnsm_raw, sizeof(rnsm_raw)) == 64U);
+
+    elrs_data_tunnel_t tx_tun;
+    elrs_tunnel_init(&tx_tun, 1U);
+    assert(elrs_tunnel_enqueue_tx(&tx_tun, rnsm_raw, 64U, false));
+
+    while (elrs_tunnel_has_pending_tx(&tx_tun)) {
+        /* Step Radio 1 FHSS clock continuously while feeding DATA fragments */
+        xr4_dual_radio_elrs_tock(&xr4_lead);
+        uint8_t data_ota8[8] = {0};
+        assert(elrs_tunnel_next_tx_frame(&tx_tun, &xr4_lead.ota, data_ota8));
+        assert(xr4_dual_radio_on_elrs_rx(&xr4_lead, data_ota8, -42, 40, 1050UL));
+    }
+
+    /* Verify XR4 executed Slot 1 (#86 GLOBAL_POS_VEL = 65B) AND simultaneously bridged 64B RNSM out Radio 2 (868 MHz) */
+    assert(xr4_lead.last_mavlink_len == 65U);
+    assert(xr4_lead.mesh_bridge_cnt == 1U);
+    assert(xr4_lead.mesh_tx_cnt == 1U);
+    assert(g_mock_lr1121.last_tx_len[LR1121_RADIO_2] == 64U);
+    assert(g_mock_lr1121.freq_hz[LR1121_RADIO_1] >= 2400000000UL); /* Radio 1 NEVER left 2.4 GHz! */
+
+    /* Now feed the bridged 64B 868 MHz LoRa packet into a second XR4 (Wingman Slot 2) on Radio 2 */
+    uint8_t bridged_lora[64];
+    memcpy(bridged_lora, g_mock_lr1121.last_tx_buf[LR1121_RADIO_2], 64U);
+
+    xr4_dual_radio_t xr4_wing2;
+    const uint8_t hw_id2[8] = {0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x02};
+    assert(xr4_dual_radio_init(&xr4_wing2,
+                               "WinniePico",
+                               ELRS_DOMAIN_CE2G4,
+                               13U,
+                               868000000UL,
+                               500000UL,
+                               7U,
+                               LR1121_LORA_CR_4_5,
+                               14,
+                               2U, /* Drone Slot 2 */
+                               hw_id2));
+
+    assert(xr4_dual_radio_on_mesh_rx(&xr4_wing2, bridged_lora, 64U, -55, 44, 2000UL));
+    assert(xr4_wing2.last_mavlink_len == 65U); /* MAVLink #84 SET_POSITION_TARGET_LOCAL_NED */
+    assert(xr4_wing2.pending_relay_valid);
+    assert(xr4_wing2.pending_relay_due_ms == 2045UL); /* Slot 2 TDMA window = +45 ms */
+
+    /* Before +45 ms: TDMA relay holds while Radio 1 keeps hopping on 2.4 GHz */
+    xr4_dual_radio_elrs_tock(&xr4_wing2);
+    assert(!xr4_dual_radio_service_tdma(&xr4_wing2, 2044UL));
+    /* At +45 ms: Radio 2 fires the relayed 64B RNSM packet with hops incremented 0 -> 1 */
+    assert(xr4_dual_radio_service_tdma(&xr4_wing2, 2045UL));
+    assert(xr4_wing2.mesh_tx_cnt == 1U);
+    assert(g_mock_lr1121.last_tx_buf[LR1121_RADIO_2][1] == 1U);
+
+    printf("[PASS] test_xr4_lr1121_dual_radio_and_bridge (RadioMaster XR4 2x LR1121 simultaneous 2.4GHz ELRS + 868MHz RNS mesh)\n");
+}
+
 int main(void) {
     test_uid_md5();
     test_fhss_invariants();
@@ -1426,6 +1628,7 @@ int main(void) {
     test_edgetx_lua_script_end_to_end();
     test_multi_drone_mesh_and_formation();
     test_slot_tdma_and_multi_drone_bundle();
+    test_xr4_lr1121_dual_radio_and_bridge();
     printf("All host unit tests PASSED.\n");
     return 0;
 }

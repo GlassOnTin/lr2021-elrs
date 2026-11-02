@@ -12,7 +12,7 @@ This document records the hardware and simulation tests run against the `lr2021-
 
 ## 1. Host Unit Tests (`tests/test_elrs_host.cpp`)
 
-All 12 host unit test suites run cleanly under `g++`:
+All 14 host unit test suites run cleanly under `g++`:
 1. `test_uid_md5`: ExpressLRS MD5 binding phrase to 6-byte UID derivation.
 2. `test_fhss_invariants`: FHSS hop sequence generation across `AU915`, `FCC915`, `EU868`, and `ISM2G4`.
 3. `test_ota4_and_ota8_roundtrip`: `SYNC`, `RC4`, `RC8`, and `LINKSTATS` packing, unpacking, and `CRC14`/`CRC16`.
@@ -25,6 +25,8 @@ All 12 host unit test suites run cleanly under `g++`:
 10. `test_rns_identity_pairing_and_lua_crsf`: SHA-256, 16-byte `SINGLE` `dest_hash`, `RNSA`/`RNSP`/`RNSC`, and CRSF `0x7A`/`0x7B`/`0x21`.
 11. `test_edgetx_lua_script_end_to_end`: Embedded Lua 5.2 VM executing [`tools/rns_elrs.lua`](../tools/rns_elrs.lua) Pages 1–4 against C++ CRSF decoders.
 12. `test_multi_drone_mesh_and_formation`: 64-byte `RNSF` formation packets, multi-hop ping-pong relay chain with hop and TTL expiration, and MAVLink `#84`/`#86` velocity/position-velocity frames.
+13. `test_slot_tdma_and_multi_drone_bundle`: Deterministic `(slot_id - 1) × 45 ms` Slot-TDMA relay windows and 64-byte `RNSM` (`0xA8`) 4-drone command bundle roundtrip + tamper rejection.
+14. `test_xr4_lr1121_dual_radio_and_bridge`: RadioMaster XR4 (`2× Semtech LR1121`) SPI driver initialization (`0x0112` RF switch `{15,0,12,8,8,6,0,5}`, `HF_PA`/`HP_PA`, 8B↔14B Hamming FEC with 1-bit error correction) and simultaneous `2G4_K1000` ELRS + `868 MHz` `RNSM` LoRa mesh bridging + `45 ms` Slot-TDMA relay without interrupting 2.4 GHz FHSS hops.
 
 ---
 
@@ -107,3 +109,4 @@ Verified using [`tools/rns_multi_drone_sitl.py`](../tools/rns_multi_drone_sitl.p
      - `hops=3` (`Slot 4`): `RNS_MULTI_RX src=LORA hops=3 seq=1 slot=4 act=4 type=1 mav_len=45` (`MAVLink #76 RTL`) -> `RNS_RELAY_EXPIRED hops=4 max_hops=4`
    - **Hybrid 200 Hz `ELRS_RX` -> 868 MHz LoRa Mesh Burst**: While locked on `EU868 900_200HZ` (`ELRS_TX` -> `ELRS_RX`), tunneling `rns_multi` over odd FHSS nonces triggered `ELRS_RNS_RX len=64` -> `RNS_HYBRID_BURST_TX len=64 hops=1 freq=868000000 burst_cnt=1` on the single-radio receiver while `TIMER20` maintained `OtaNonce` + `FHSS` lock (`STATUS mode=ELRS_RX lock=CONNECTED crc_ok=358 crc_err=3 phase_err=-12us`).
    - **Autonomous Leader Formation Broadcast (`rns_form auto vee 12.0 450 4.0 0.0`)**: Board 1 in `ELRS_RX` mode automatically broadcast 64B `RNSF` LoRa bursts every `450 ms`, which Board 2 (`RELAY`, `Slot 1`) decoded over 868 MHz RF (`RNS_FORM_RX src=LORA hops=0 seq=1..3 shape=2 slot=1 lat=-353633697 lon=1491651049 vx=400 mav_len=65`) and forwarded (`RNS_RELAY_FWD len=64 hops=1`).
+   - **Cross-Band Live Bench Loop (`TX16S MK3 + XR4 + TMotorH743` on `2G4_K1000 CE_LBT` -> `868.0 MHz` `RNSM` LoRa Burst -> Wingman `D56B6941`)**: With `FC6D1A37` locked to the live `TX16S MK3 ↔ XR4` 1000 Hz 2.4 GHz link (`UID=EB:71:09:FA:46:6A`, `vbatt=16024 mV`, `chancount=16`), firing `rns_multi OFS:-10,-15,5 VEL:5,-2,0 LOITER RTL` switched `FC6D1A37` from `2.4 GHz GFSK` to `868.0 MHz LoRa` (`RNS_HYBRID_BURST_TX len=64`), delivered `MAVLink #86` (`mav_len=65`, `rssi=-90 dBm`, `snr=+15 dB`) to `D56B6941`, and snapped back to `2G4_K1000` while maintaining lock (`crc_ok: 1438 -> 2175`, `hops: 1088 -> 1913`, `phase_err: 6 us -> 3 us`).

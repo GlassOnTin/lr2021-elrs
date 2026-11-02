@@ -50,10 +50,11 @@ flowchart LR
 - **Reticulum-over-ExpressLRS Tunnel (`ELRS_PKT_TYPE_DATA`)**: Multiplexes Reticulum packets up to 500 bytes across active 200 Hz / 1000 Hz ExpressLRS FHSS links without needing a second radio.
 - **EdgeTX Handset Tool ([`tools/rns_elrs.lua`](tools/rns_elrs.lua))**: 4-page handset UI (`480x272` ColorLCD and `128x64` B&W) for over-the-air Reticulum pairing (`RNSP`), LoRa configuration, peer selection, targeted drone commands (`RNSC`), and swarm formation triggers (`[Form:VEE]`, `[Form:LINE]`, `[Form:HOLD]`).
 - **Multi-Drone Formation (`RNSF`) & Multi-Slot Command Bundles (`RNSM`)**: Distributes 64-byte signed formation packets (`VEE`, `LINE`, `COLUMN`, `HOLD`, including periodic `rns_form auto`) and 64-byte 4-slot independent command bundles (`rns_multi` with per-slot `OFS:n,e,d`, `VEL:vn,ve,vd`, `LOITER`, `RTL`, `LAND`, `ARM`, `DISARM`), backed by a 3.0 s dead-man `LOITER` watchdog.
-- **Hybrid `ELRS_RX` LoRa Burst & Deterministic Slot-TDMA**: A single-radio Lead Drone in `ELRS_RX` mode can remain phase-locked to a 200 Hz ExpressLRS RC link while injecting `~33 ms` 868 MHz LoRa bursts (`BW500 SF7`) into the follower mesh. Followers (`Slots 1..7`) relay swarm packets in non-overlapping `(slot_id - 1) × 45 ms` TDMA windows to avoid half-duplex collisions.
+- **Hybrid `ELRS_RX` LoRa Burst & Deterministic Slot-TDMA**: A single-radio Lead Drone in `ELRS_RX` mode can remain phase-locked to a 200 Hz / 1000 Hz ExpressLRS RC link while injecting `~33 ms` 868 MHz LoRa bursts (`BW500 SF7`) into the follower mesh. Followers (`Slots 1..7`) relay swarm packets in non-overlapping `(slot_id - 1) × 45 ms` TDMA windows to avoid half-duplex collisions.
+- **Unified RadioMaster XR4 (`ESP32-PICO-D4 + 2× Semtech LR1121`) Target**: Builds from the same protocol tree via PlatformIO (`pio run -e radiomaster_xr4`), dedicating **Radio 1 (`LR1121 #1`)** full-time to 2.4 GHz `2G4_K1000` ExpressLRS and **Radio 2 (`LR1121 #2`)** full-time to the 868 MHz Reticulum LoRa mesh with zero time-slicing.
 
 ### Hardware & Radio Constraints
-- **Single Transceiver per Board (`1× LR2021`)**: Each board has one PLL/baseband path, so same-band simultaneous TX+RX is not possible. `ELRS_RX` bridges to the 868 MHz LoRa mesh by time-slicing brief LoRa bursts while `TIMER20` tracks `OtaNonce` and `FHSS` hops in the background.
+- **Single Transceiver (`Wio-LR2021`) vs Dual Transceiver (`RadioMaster XR4 2× LR1121`)**: Each `Wio-LR2021` board has one PLL/baseband path, so `ELRS_RX` bridges to the 868 MHz LoRa mesh by time-slicing brief LoRa bursts while `TIMER20` tracks `OtaNonce` and `FHSS` hops in the background. On the **RadioMaster XR4** target (`2× LR1121`), Radio 1 stays on 2.4 GHz ELRS continuously while Radio 2 runs 868 MHz Reticulum LoRa mesh simultaneously.
 - **Half-Duplex Relay Cadence**: At `868 MHz, BW = 500 kHz, SF7` (`~33 ms` Time-on-Air per 64B `RNSF`/`RNSM` packet), deterministic `45 ms` Slot-TDMA windows let a multi-drone chain relay without collisions at `2–4 Hz`.
 - **Oscillator & RF Limits**: The Wio-LR2021 uses a passive 32 MHz crystal (never send `SET_TCXO_MODE 0x0120`), and maximum RF input at `ANT_LF`/`ANT_HF` is `+10 dBm`. Always attach antennas before transmitting.
 
@@ -61,13 +62,17 @@ flowchart LR
 
 ## Build, Test & Flash
 
-### 1. Build Firmware (`arm-none-eabi-gcc` 12+, `cmake` 3.20+)
+### 1. Build Firmware (`XIAO nRF54L15 + Wio-LR2021` & `RadioMaster XR4`)
 ```bash
+# Build XIAO nRF54L15 + Wio-LR2021 firmware (arm-none-eabi-gcc 12+, cmake 3.20+)
 cmake -B build -DCMAKE_TOOLCHAIN_FILE=firmware/toolchain-arm-none-eabi.cmake -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
+
+# Build RadioMaster XR4 (ESP32-PICO-D4 + 2x LR1121) firmware (PlatformIO)
+pio run -e radiomaster_xr4
 ```
 
-### 2. Run Host Unit Tests (13 Suites, Including Embedded Lua 5.2 VM)
+### 2. Run Host Unit Tests (14 Suites, Including Embedded Lua 5.2 VM & Dual-LR1121 XR4)
 ```bash
 mkdir -p build_host
 g++ -std=c++17 -O2 -Wall -Wextra -I. \
@@ -75,6 +80,7 @@ g++ -std=c++17 -O2 -Wall -Wextra -I. \
     firmware/elrs/elrs_protocol.cpp \
     firmware/crsf/crsf.cpp \
     firmware/rnode/rns_node.cpp \
+    firmware/radio/lr1121_driver.cpp \
     -ldl -o build_host/test_elrs_host
 ./build_host/test_elrs_host
 ```
