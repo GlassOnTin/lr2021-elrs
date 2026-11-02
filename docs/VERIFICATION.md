@@ -99,3 +99,11 @@ Verified using [`tools/rns_multi_drone_sitl.py`](../tools/rns_multi_drone_sitl.p
 3. **4-Hop Ping-Pong Relay Chain & Hop/TTL Expiration (`rns_chain 4 120 3000` & `rns_chain 10 250 550`)**:
    - Single `RNSF` packet bounced 4 hops across `FC6D1A37` and `D56B6941` (`hops = 0 -> 1 -> 2 -> 3 -> 4`, computing Slots `1..5`) and stopped at `hops == 4` (`RNS_RELAY_EXPIRED hops=4 max_hops=4 ttl_ms=3000 total_exp=1`).
    - With `ttl_ms = 550` and `delay_ms = 250`, the chain stopped at `hops = 2` (`562 ms > 550 ms`) with `RNS_RELAY_EXPIRED hops=2 max_hops=10 ttl_ms=550 total_exp=1`.
+3. **Combined 64B Multi-Drone Bundle (`RNSM` `0xA8`), Deterministic Slot-TDMA & Hybrid `ELRS_RX` LoRa Burst**:
+   - **Single-Packet 4-Slot Execution**: Transmitting `rns_multi OFS:-10,-15,5 VEL:5,-2,0 LOITER RTL` across `rns_chain 4 120 3000` executed all four slot actions across four RF hops from a single 64-byte frame:
+     - `hops=0` (`Slot 1`): `RNS_MULTI_RX src=LORA hops=0 seq=1 slot=1 act=1 type=10 lat=-353633518 lon=1491650718 alt_m=30 mav_len=65` (`MAVLink #86 GLOBAL_POS_VEL`)
+     - `hops=1` (`Slot 2`): `RNS_MULTI_RX src=LORA hops=1 seq=1 slot=2 act=2 type=9 vx=500 vy=-200 mav_len=65` (`MAVLink #84 VEL_NED`)
+     - `hops=2` (`Slot 3`): `RNS_MULTI_RX src=LORA hops=2 seq=1 slot=3 act=3 type=2 mav_len=45` (`MAVLink #76 LOITER`)
+     - `hops=3` (`Slot 4`): `RNS_MULTI_RX src=LORA hops=3 seq=1 slot=4 act=4 type=1 mav_len=45` (`MAVLink #76 RTL`) -> `RNS_RELAY_EXPIRED hops=4 max_hops=4`
+   - **Hybrid 200 Hz `ELRS_RX` -> 868 MHz LoRa Mesh Burst**: While locked on `EU868 900_200HZ` (`ELRS_TX` -> `ELRS_RX`), tunneling `rns_multi` over odd FHSS nonces triggered `ELRS_RNS_RX len=64` -> `RNS_HYBRID_BURST_TX len=64 hops=1 freq=868000000 burst_cnt=1` on the single-radio receiver while `TIMER20` maintained `OtaNonce` + `FHSS` lock (`STATUS mode=ELRS_RX lock=CONNECTED crc_ok=358 crc_err=3 phase_err=-12us`).
+   - **Autonomous Leader Formation Broadcast (`rns_form auto vee 12.0 450 4.0 0.0`)**: Board 1 in `ELRS_RX` mode automatically broadcast 64B `RNSF` LoRa bursts every `450 ms`, which Board 2 (`RELAY`, `Slot 1`) decoded over 868 MHz RF (`RNS_FORM_RX src=LORA hops=0 seq=1..3 shape=2 slot=1 lat=-353633697 lon=1491651049 vx=400 mav_len=65`) and forwarded (`RNS_RELAY_FWD len=64 hops=1`).

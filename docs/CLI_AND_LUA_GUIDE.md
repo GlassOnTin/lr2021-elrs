@@ -39,7 +39,8 @@ Connect to the board's USB-C port (`/dev/ttyACM*`) with any terminal (`picocom -
 | `rns_to <dest_hex\|sel\|bcast> <cmd>` | Send a targeted command (`PING`, `LOITER`, `RTL`, `LAND`, `ARM`, `DISARM`, `GOTO ...`) to a specific 16B RX address (`RNSC`) |
 | `rns_cmd <cmd>` | Broadcast a drone command to `elrs.drone.cmd` (`GOTO lat lon alt`, `VEL vn ve vd [yr]`, `BVL vx vy vz [yr]`, `RTL`, `LOITER`, `LAND`, `ARM`, `DISARM`, `MODE n`, `RC c1 c2 c3 c4`) |
 | `rns_slot <0..7>` | Set formation slot (`0` = Leader, `1` = Left Wingman 1, `2` = Right Wingman 1, ...) |
-| `rns_form <vee\|line\|col\|hold> [spacing_m] [vn_ms] [ve_ms] [hdg_deg]` | Broadcast a 64-byte signed formation state packet (`RNSF`) |
+| `rns_form <vee\|line\|col\|hold\|auto> [spacing_m] [vn_ms] [ve_ms] [hdg_deg]` | Broadcast a 64-byte signed formation packet (`RNSF`) or enable periodic auto-broadcast (`rns_form auto vee 10.0 500`) |
+| `rns_multi <s1_spec> [s2_spec] [s3_spec] [s4_spec]` | Broadcast a 64-byte multi-drone command bundle (`RNSM`) driving up to 4 independent slots (`OFS:n,e,d`, `VEL:vn,ve,vd`, `LOITER`, `RTL`, `LAND`, `ARM`, `DISARM`, `NOP`) |
 | `rns_chain <off\|max_hops> [delay_ms] [ttl_ms]` | Enable or disable multi-hop ping-pong relay chain test mode with hop and TTL expiration |
 | `bcn [now\|interval_ms]` | Broadcast an immediate `rnlog.beacon` JSON telemetry packet or set periodic interval in ms |
 | `fc_sim <lat_e7> <lon_e7> <alt_m> <vbatt_mv>` | Set simulated flight controller GPS and battery state |
@@ -89,7 +90,7 @@ flowchart LR
 - **Page 1 (Identity & Pairing)**: Shows `tx_dest`, `rx_dest`, link lock, peer count, ping RTT, and native `0x21` flight mode text. Includes `[Pair & Sync RX]`, `[Announce]`, and target toggle (`0xEE` vs `0xEC`).
 - **Page 2 (RNode LoRa Config)**: Edit frequency (`868.000`, `869.525`, `915.000`, `2440.000 MHz`), bandwidth (`125`, `250`, `500`, `812.5 kHz`), spreading factor (`SF5..SF12`), coding rate (`4/5..4/8`), TX power (`-9..22 dBm`), and `IFAC`, then push OTA to the receiver.
 - **Page 3 (Mesh Peers)**: Polls up to 8 discovered Reticulum peers showing hop count, RSSI, SNR, and battery voltage. Press `ENTER` to select a peer as the active command target.
-- **Page 4 (Targeted RX Cmd)**: Sends `[Ping RX]`, `[LOITER]`, `[RTL]`, `[LAND]`, `[ARM]`, or `[DISARM]` addressed to the selected receiver's 16-byte Reticulum destination hash (`RNSC`).
+- **Page 4 (Targeted RX Cmd & Swarm Formation)**: Sends `[Ping RX]`, `[LOITER]`, `[RTL]`, `[LAND]`, `[ARM]`, or `[DISARM]` addressed to the selected receiver's 16-byte Reticulum destination hash (`RNSC`), or triggers `[Form:VEE]`, `[Form:LINE]`, and `[Form:HOLD]` swarm formation broadcasts (`RNSF`).
 
 ---
 

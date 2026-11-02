@@ -32,13 +32,17 @@ local RESP_STATUS = 0x81
 local RESP_PEER   = 0x82
 local RESP_ACK    = 0x83
 
-local ACT_ANNOUNCE = 0x01
-local ACT_PING_RX  = 0x02
-local ACT_LOITER   = 0x03
-local ACT_RTL      = 0x04
-local ACT_LAND     = 0x05
-local ACT_ARM      = 0x06
-local ACT_DISARM   = 0x07
+local ACT_ANNOUNCE  = 0x01
+local ACT_PING_RX   = 0x02
+local ACT_LOITER    = 0x03
+local ACT_RTL       = 0x04
+local ACT_LAND      = 0x05
+local ACT_ARM       = 0x06
+local ACT_DISARM    = 0x07
+local ACT_FORM_VEE  = 0x08
+local ACT_FORM_LINE = 0x09
+local ACT_FORM_COL  = 0x0A
+local ACT_FORM_HOLD = 0x0B
 
 local MODE_NAMES = { [0]="IDLE", [1]="PONG", [2]="ELRS_TX", [3]="ELRS_RX", [4]="MONITOR", [5]="BRIDGE", [6]="RNODE", [7]="RELAY" }
 local LOCK_NAMES = { [0]="DISC", [1]="TENT", [2]="LOCKED" }
@@ -354,12 +358,15 @@ local function drawPage4()
   y = y + dy
 
   local btns = {
-    { "Ping RX", ACT_PING_RX },
-    { "LOITER",  ACT_LOITER  },
-    { "RTL",     ACT_RTL     },
-    { "LAND",    ACT_LAND    },
-    { "ARM",     ACT_ARM     },
-    { "DISARM",  ACT_DISARM  }
+    { "Ping RX",   ACT_PING_RX   },
+    { "LOITER",    ACT_LOITER    },
+    { "RTL",       ACT_RTL       },
+    { "LAND",      ACT_LAND      },
+    { "ARM",       ACT_ARM       },
+    { "DISARM",    ACT_DISARM    },
+    { "Form:VEE",  ACT_FORM_VEE  },
+    { "Form:LINE", ACT_FORM_LINE },
+    { "Form:HOLD", ACT_FORM_HOLD }
   }
   local x = 6
   for i = 1, #btns do
@@ -390,7 +397,7 @@ local function handleEvent(event)
   local maxCursor = 3
   if state.page == 2 then maxCursor = 7
   elseif state.page == 3 then maxCursor = math.max(1, state.peer_count)
-  elseif state.page == 4 then maxCursor = 6 end
+  elseif state.page == 4 then maxCursor = 9 end
 
   if event == EVT_VIRTUAL_NEXT then
     if state.editing and state.page == 2 then
@@ -438,7 +445,11 @@ local function handleEvent(event)
       state.selected_peer = sel
       state.status_msg = "Selected Peer #" .. sel
     elseif state.page == 4 then
-      local acts = { ACT_PING_RX, ACT_LOITER, ACT_RTL, ACT_LAND, ACT_ARM, ACT_DISARM }
+      local acts = {
+        ACT_PING_RX, ACT_LOITER, ACT_RTL,
+        ACT_LAND, ACT_ARM, ACT_DISARM,
+        ACT_FORM_VEE, ACT_FORM_LINE, ACT_FORM_HOLD
+      }
       local act = acts[state.cursor]
       if act then
         sendRnsCmd(SUBCMD_ACTION, { act })

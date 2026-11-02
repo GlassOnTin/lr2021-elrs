@@ -147,9 +147,23 @@ static rns_peer_table_t     g_rns_peers;
 static uint8_t              g_rns_cmd_seq = 1U;
 static uint8_t              g_swarm_slot_id      = 0U;   /* 0 = Leader, 1..7 = Wingman/Follower slots */
 static uint8_t              g_form_seq           = 1U;
+static uint8_t              g_multi_seq          = 1U;
 static bool                 g_mesh_ctrl_active   = false;
 static uint32_t             g_last_mesh_ctrl_ms  = 0U;
 #define RNS_MESH_WATCHDOG_MS 3000U /* 3.0s dead-man brake matching Anisoptera GUID_TIMEOUT */
+
+/* Hybrid ELRS_RX -> LoRa Mesh Burst state & autonomous formation broadcast timer */
+static volatile bool        g_elrs_lora_burst_active   = false;
+static volatile bool        g_elrs_lora_burst_done     = false;
+static uint32_t             g_elrs_lora_burst_start_ms = 0U;
+static uint32_t             g_elrs_lora_burst_count    = 0U;
+
+static uint32_t             g_auto_form_interval_ms    = 0U;
+static uint32_t             g_last_auto_form_ms        = 0U;
+static uint8_t              g_auto_form_shape          = RNS_FORM_VEE;
+static uint16_t             g_auto_form_spacing_dm     = 100U;
+static int16_t              g_auto_form_vx_cms         = 0;
+static int16_t              g_auto_form_vy_cms         = 0;
 
 static void format_hex_bytes(const uint8_t *in, size_t len, char *out) {
     static const char hex[] = "0123456789abcdef";
@@ -378,6 +392,90 @@ static void configure_radio_for_current_rate(void) {
     hal_hwtimer_update_interval(rate->interval_us);
 }
 
+static void start_elrs_lora_mesh_burst(const uint8_t *pkt, uint8_t len) {
+    if (pkt == NULL || len == 0U) {
+        return;
+    }
+    g_elrs_lora_burst_active   = true;
+    g_elrs_lora_burst_done     = false;
+    g_elrs_lora_burst_start_ms = hal_millis();
+
+    uint8_t bw_code = lr2021_lora_bw_from_hz(g_rnode_cfg.bandwidth_hz);
+    uint8_t sf      = (g_rnode_cfg.sf >= 5U && g_rnode_cfg.sf <= 12U) ? g_rnode_cfg.sf : 7U;
+    uint8_t cr_code = (g_rnode_cfg.cr >= 5U && g_rnode_cfg.cr <= 8U)
+                          ? (uint8_t)(g_rnode_cfg.cr - 4U)
+                          : (uint8_t)LR2021_RADIO_LORA_CR_4_5;
+    bool is_subghz  = (g_rnode_cfg.frequency_hz < 1000000000UL);
+
+    lr2021_config_lora(bw_code,
+                       sf,
+                       cr_code,
+                       g_rnode_cfg.frequency_hz,
+                       18U,
+                       false,
+                       RNODE_LORA_MAX_PKT,
+                       true,
+                       true);
+    lr2021_set_lora_syncword(0x12U);
+    lr2021_set_tx_power_dbm(g_rnode_cfg.txpower_dbm, is_subghz);
+    rns_relay_record_sent(&g_rns_relay, pkt, len, g_elrs_lora_burst_start_ms);
+    g_rnode_cfg.tx_bytes += len;
+    g_elrs_lora_burst_count++;
+    lr2021_tx_nb(pkt, len);
+}
+
+static void restore_elrs_rx_after_lora_burst(void) {
+    g_elrs_lora_burst_active = false;
+    g_elrs_lora_burst_done   = false;
+    const elrs_air_rate_config_t *rate = elrs_get_air_rate_by_index(g_rate_idx);
+    if (rate == NULL) {
+        return;
+    }
+    bool rate_is_2g4 = (rate->phy_type == ELRS_PHY_LORA_2G4 ||
+                        rate->phy_type == ELRS_PHY_FLRC_2G4 ||
+                        rate->phy_type == ELRS_PHY_FSK_2G4);
+    uint32_t curr_freq = (g_lock_state == LOCK_DISCONNECTED)
+                             ? elrs_fhss_get_initial_freq(&g_fhss)
+                             : elrs_fhss_get_curr_freq(&g_fhss);
+    bool invert_iq = (g_ota.uid[5] & 0x01U) != 0U;
+
+    if (rate->phy_type == ELRS_PHY_LORA_900 || rate->phy_type == ELRS_PHY_LORA_2G4) {
+        lr2021_config_lora(rate->bw,
+                           rate->sf,
+                           rate->cr,
+                           curr_freq,
+                           rate->preamble_len,
+                           invert_iq,
+                           rate->payload_len,
+                           false,
+                           false);
+    } else if (rate->phy_type == ELRS_PHY_FLRC_2G4) {
+        lr2021_config_flrc(rate->bw,
+                           rate->cr,
+                           rate->sf,
+                           curr_freq,
+                           rate->preamble_len,
+                           g_ota.uid_seed,
+                           g_ota.crc_init,
+                           rate->payload_len);
+    } else {
+        uint32_t bitrate = (uint32_t)rate->bw * 10000UL;
+        uint32_t fdev    = (uint32_t)rate->cr * 1000UL;
+        bool use_fec     = (rate->payload_len == ELRS_OTA4_PACKET_SIZE);
+        lr2021_config_fsk(bitrate,
+                          rate->sf,
+                          fdev,
+                          curr_freq,
+                          rate->preamble_len,
+                          g_ota.uid[5],
+                          g_ota.uid[4],
+                          rate->payload_len,
+                          use_fec);
+    }
+    lr2021_set_tx_power_dbm(g_tx_power_dbm, !rate_is_2g4);
+    lr2021_rx_nb();
+}
+
 /* ============================================================================
  * ExpressLRS Hardware Timer Tick / Tock & Radio DIO8 ISR Callbacks
  * ============================================================================ */
@@ -446,6 +544,17 @@ static void elrs_hwtimer_tock_cb(void) {
     }
 
     if (g_app_mode == APP_MODE_ELRS_RX || g_app_mode == APP_MODE_MONITOR) {
+        if (g_elrs_lora_burst_active || g_elrs_lora_burst_done) {
+            /* Keep OtaNonce and FHSS sequence advancing in lockstep while radio is in LoRa burst */
+            if (g_lock_state != LOCK_DISCONNECTED) {
+                g_ota.ota_nonce++;
+                if ((g_ota.ota_nonce % rate->fhss_hop_interval) == 0U) {
+                    (void)elrs_fhss_advance_and_get_freq(&g_fhss);
+                    g_fhss_hop_count++;
+                }
+            }
+            return;
+        }
         if (g_lock_state == LOCK_DISCONNECTED) {
             /* Stay parked on initial sync channel waiting for SYNC packet */
             return;
@@ -537,6 +646,11 @@ static void elrs_hwtimer_tock_cb(void) {
 }
 
 static void radio_tx_done_isr(void) {
+    if (g_elrs_lora_burst_active) {
+        g_elrs_lora_burst_active = false;
+        g_elrs_lora_burst_done   = true;
+        return;
+    }
     if (g_app_mode == APP_MODE_RNODE) {
         if (g_rnode_tx_frag_idx < g_rnode_tx_frag_total) {
             g_rnode_next_frag_due_ms = hal_millis() + 5U;
@@ -1109,8 +1223,10 @@ static void start_mode(app_mode_t new_mode) {
     g_tentative_hops      = 0U;
     g_tentative_from_pair = false;
     g_prev_sync_ch_us     = 0U;
-    g_rns_rx_flag         = false;
-    g_relay_pending       = false;
+    g_rns_rx_flag            = false;
+    g_relay_pending          = false;
+    g_elrs_lora_burst_active = false;
+    g_elrs_lora_burst_done   = false;
     hal_led_set(false);
     refresh_rns_identity();
 
@@ -1280,7 +1396,17 @@ static bool send_or_tunnel_rns_packet(const uint8_t *pkt, uint16_t len) {
         return false;
     }
     if (g_app_mode == APP_MODE_ELRS_TX || g_app_mode == APP_MODE_ELRS_RX) {
-        return elrs_tunnel_enqueue_tx(&g_elrs_tunnel, pkt, len, g_ota.is_full_res);
+        bool tun_ok = elrs_tunnel_enqueue_tx(&g_elrs_tunnel, pkt, len, g_ota.is_full_res);
+        /* If Lead Drone is in ELRS_RX mode and originates a swarm broadcast (RNSF/RNSM),
+         * also queue a LoRa mesh burst so wingmen on the 868 MHz LoRa mesh receive it */
+        if (g_app_mode == APP_MODE_ELRS_RX && len <= RNODE_LORA_MAX_PKT &&
+            len >= 23U && (pkt[18] == 0xA7U || pkt[18] == 0xA8U) && !g_relay_pending) {
+            memcpy(g_relay_tx_buf, pkt, len);
+            g_relay_tx_len  = (uint8_t)len;
+            g_relay_due_ms  = hal_millis() + 5U;
+            g_relay_pending = true;
+        }
+        return tun_ok;
     }
     if (g_app_mode == APP_MODE_RELAY || g_app_mode == APP_MODE_RNODE) {
         if (len > RNODE_LORA_MAX_PKT) {
@@ -1499,6 +1625,37 @@ static void inspect_and_act_on_rns_packet(const uint8_t *pkt, uint16_t len, cons
         }
     }
 
+    /* 0e. Check if Combined Multi-Drone Command Bundle (RNSM context 0xA8) */
+    rns_multi_drone_pkt_t mp;
+    if (rns_parse_multi_drone_pkt(pkt, len, &mp)) {
+        uint8_t eff_slot = g_rns_relay.bounce_test_mode
+                               ? (uint8_t)((hops + 1U <= RNS_MULTI_MAX_SLOTS) ? (hops + 1U) : RNS_MULTI_MAX_SLOTS)
+                               : g_swarm_slot_id;
+        rns_drone_cmd_t mcmd;
+        if (rns_extract_multi_slot_cmd(&mp, eff_slot, &mcmd)) {
+            uint8_t mav_frame[72];
+            size_t mav_len = rns_build_mavlink_command(&mcmd, g_mav_tx_seq++, mav_frame, sizeof(mav_frame));
+            if (mav_len > 0U) {
+                hal_crsf_uart_write(mav_frame, mav_len);
+            }
+            if (mcmd.type == RNS_DRONE_CMD_GLOBAL_POS_VEL || mcmd.type == RNS_DRONE_CMD_VEL_NED) {
+                g_last_mesh_ctrl_ms = hal_millis();
+                g_mesh_ctrl_active  = true;
+            } else if (mcmd.type == RNS_DRONE_CMD_LOITER || mcmd.type == RNS_DRONE_CMD_RTL || mcmd.type == RNS_DRONE_CMD_LAND) {
+                g_mesh_ctrl_active  = false;
+            }
+            uint8_t slot_act = (eff_slot >= 1U && eff_slot <= RNS_MULTI_MAX_SLOTS)
+                                   ? mp.slots[eff_slot - 1U].action
+                                   : 0U;
+            hal_usb_uart_printf("RNS_MULTI_RX src=%s hops=%u seq=%u slot=%u act=%u type=%u lat=%ld lon=%ld alt_m=%ld vx=%d vy=%d mav_len=%u\r\n",
+                                src_tag, hops, (unsigned)mp.seq, (unsigned)eff_slot,
+                                (unsigned)slot_act, (unsigned)mcmd.type,
+                                (long)mcmd.lat_deg_e7, (long)mcmd.lon_deg_e7, (long)mcmd.alt_m,
+                                (int)mcmd.vx_cms, (int)mcmd.vy_cms, (unsigned)mav_len);
+            return;
+        }
+    }
+
     /* 1. Check if addressed to "rnlog.beacon" */
     if (!ifac && memcmp(&pkt[2], RNS_DEST_RNLOG_BEACON, 16U) == 0) {
         uint16_t pay_len = (uint16_t)(len - RNS_MIN_PACKET_LEN);
@@ -1664,6 +1821,29 @@ static size_t process_crsf_rns_frame(const uint8_t *frame, uint8_t frame_len, ui
                 bool ok = send_rns_targeted_cmd(target_dest, cstr, g_rns_cmd_seq++);
                 return crsf_build_rns_ack_frame(subcmd, ok ? 0U : 1U, out_resp);
             }
+            if (act >= CRSF_RNS_ACT_FORM_VEE && act <= CRSF_RNS_ACT_FORM_HOLD) {
+                uint8_t fshape = RNS_FORM_VEE;
+                if (act == CRSF_RNS_ACT_FORM_LINE)      fshape = RNS_FORM_LINE_ABREAST;
+                else if (act == CRSF_RNS_ACT_FORM_COL)  fshape = RNS_FORM_COLUMN;
+                else if (act == CRSF_RNS_ACT_FORM_HOLD) fshape = RNS_FORM_HOLD_BRAKE;
+
+                rns_formation_pkt_t fp;
+                memset(&fp, 0, sizeof(fp));
+                memcpy(fp.leader_dest, g_rns_id.dest_hash, 16U);
+                fp.seq           = g_form_seq++;
+                fp.shape         = fshape;
+                fp.spacing_dm    = g_auto_form_spacing_dm;
+                fp.leader_lat_e7 = (g_fc_tlm.lat_deg_e7 != 0) ? g_fc_tlm.lat_deg_e7 : -353632620L;
+                fp.leader_lon_e7 = (g_fc_tlm.lon_deg_e7 != 0) ? g_fc_tlm.lon_deg_e7 : 1491652370L;
+                fp.leader_alt_mm = (g_fc_tlm.rel_alt_mm != 0) ? g_fc_tlm.rel_alt_mm : 25000L;
+                fp.vx_cms        = g_auto_form_vx_cms;
+                fp.vy_cms        = g_auto_form_vy_cms;
+                fp.heading_cdeg  = g_fc_tlm.heading_cdeg;
+                uint8_t fpkt[64];
+                size_t flen = rns_build_formation_pkt(&fp, fpkt, sizeof(fpkt));
+                bool ok = send_or_tunnel_rns_packet(fpkt, (uint16_t)flen);
+                return crsf_build_rns_ack_frame(subcmd, ok ? 0U : 1U, out_resp);
+            }
             return crsf_build_rns_ack_frame(subcmd, 1U, out_resp);
         }
 
@@ -1711,7 +1891,8 @@ static void handle_cli_command(char *line) {
             "  crsf_ota <status|peer|ann|pair|ping|loiter|rtl> - Tunnel CRSF 0x7A request over the air to RX\r\n"
             "  rns_slot <0..7>                - Set drone formation slot (0=Leader, 1=Left1, 2=Right1, ...)\r\n"
             "  rns_chain <off|max_hops> [delay_ms] [ttl_ms] - Multi-hop ping-pong relay test chain & expiration\r\n"
-            "  rns_form <vee|line|col|hold> [spacing_m] [vn_ms] [ve_ms] [hdg_deg] - Broadcast formation state\r\n"
+            "  rns_form <vee|line|col|hold|auto> [spacing_m] [vn_ms] [ve_ms] [hdg_deg] - Broadcast formation state\r\n"
+            "  rns_multi <s1_spec> [s2] [s3] [s4] - Combined 64B multi-drone bundle (OFS:n,e,d | VEL:vn,ve,vd | RTL...)\r\n"
             "  rns_cmd <GOTO|VEL|BVL|RTL|LAND|LOITER|ARM|DISARM|MODE n|RC ...>    - Send RNS drone cmd\r\n"
             "  rns_tx <hex_bytes>             - Send raw Reticulum packet over Relay LoRa or ELRS tunnel\r\n"
             "  fc_sim <lat_e7> <lon_e7> <alt_m> <vbatt_mv> - Set simulated FC telemetry for beacons\r\n"
@@ -2111,6 +2292,10 @@ static void handle_cli_command(char *line) {
             else if (strcasecmp(sub, "land") == 0)   act = CRSF_RNS_ACT_LAND;
             else if (strcasecmp(sub, "arm") == 0)    act = CRSF_RNS_ACT_ARM;
             else if (strcasecmp(sub, "disarm") == 0) act = CRSF_RNS_ACT_DISARM;
+            else if (strcasecmp(sub, "vee") == 0)    act = CRSF_RNS_ACT_FORM_VEE;
+            else if (strcasecmp(sub, "line") == 0)   act = CRSF_RNS_ACT_FORM_LINE;
+            else if (strcasecmp(sub, "col") == 0)    act = CRSF_RNS_ACT_FORM_COL;
+            else if (strcasecmp(sub, "hold") == 0)   act = CRSF_RNS_ACT_FORM_HOLD;
             if (act != 0U) {
                 req_len = crsf_build_rns_cmd_frame(CRSF_RNS_SUBCMD_ACTION, &act, 1U, req);
             }
@@ -2174,6 +2359,10 @@ static void handle_cli_command(char *line) {
             else if (strcasecmp(sub, "land") == 0)   act = CRSF_RNS_ACT_LAND;
             else if (strcasecmp(sub, "arm") == 0)    act = CRSF_RNS_ACT_ARM;
             else if (strcasecmp(sub, "disarm") == 0) act = CRSF_RNS_ACT_DISARM;
+            else if (strcasecmp(sub, "vee") == 0)    act = CRSF_RNS_ACT_FORM_VEE;
+            else if (strcasecmp(sub, "line") == 0)   act = CRSF_RNS_ACT_FORM_LINE;
+            else if (strcasecmp(sub, "col") == 0)    act = CRSF_RNS_ACT_FORM_COL;
+            else if (strcasecmp(sub, "hold") == 0)   act = CRSF_RNS_ACT_FORM_HOLD;
             if (act != 0U) {
                 req_len = crsf_build_rns_cmd_frame(CRSF_RNS_SUBCMD_ACTION, &act, 1U, req);
             }
@@ -2240,7 +2429,38 @@ static void handle_cli_command(char *line) {
     if (strcmp(cmd, "rns_form") == 0) {
         char *shape_s = strtok(NULL, " ");
         if (shape_s == NULL) {
-            hal_usb_uart_puts("ERR: usage: rns_form <vee|line|col|hold> [spacing_m] [vn_ms] [ve_ms] [hdg_deg]\r\n");
+            hal_usb_uart_puts("ERR: usage: rns_form <vee|line|col|hold|auto> [spacing_m] [vn_ms] [ve_ms] [hdg_deg]\r\n");
+            return;
+        }
+        if (strcasecmp(shape_s, "auto") == 0) {
+            char *sub_shape = strtok(NULL, " ");
+            char *sp_s      = strtok(NULL, " ");
+            char *per_s     = strtok(NULL, " ");
+            char *vn_s      = strtok(NULL, " ");
+            char *ve_s      = strtok(NULL, " ");
+            if (sub_shape == NULL || strcasecmp(sub_shape, "off") == 0 || strcmp(sub_shape, "0") == 0) {
+                g_auto_form_interval_ms = 0U;
+                hal_usb_uart_puts("OK RNS_FORM_AUTO enabled=0\r\n");
+                return;
+            }
+            if (strcasecmp(sub_shape, "vee") == 0)       g_auto_form_shape = RNS_FORM_VEE;
+            else if (strcasecmp(sub_shape, "line") == 0) g_auto_form_shape = RNS_FORM_LINE_ABREAST;
+            else if (strcasecmp(sub_shape, "col") == 0)  g_auto_form_shape = RNS_FORM_COLUMN;
+            else if (strcasecmp(sub_shape, "hold") == 0) g_auto_form_shape = RNS_FORM_HOLD_BRAKE;
+
+            float sp_m = sp_s ? strtof(sp_s, NULL) : 10.0f;
+            g_auto_form_spacing_dm  = (uint16_t)(sp_m * 10.0f);
+            g_auto_form_interval_ms = per_s ? (uint32_t)strtoul(per_s, NULL, 10) : 500UL;
+            if (g_auto_form_interval_ms < 100UL) g_auto_form_interval_ms = 100UL;
+            g_auto_form_vx_cms      = vn_s ? (int16_t)(strtof(vn_s, NULL) * 100.0f) : 0;
+            g_auto_form_vy_cms      = ve_s ? (int16_t)(strtof(ve_s, NULL) * 100.0f) : 0;
+            g_last_auto_form_ms     = 0U;
+            hal_usb_uart_printf("OK RNS_FORM_AUTO enabled=1 shape=%u spacing_dm=%u interval_ms=%lu vx=%d vy=%d\r\n",
+                                (unsigned)g_auto_form_shape,
+                                (unsigned)g_auto_form_spacing_dm,
+                                (unsigned long)g_auto_form_interval_ms,
+                                (int)g_auto_form_vx_cms,
+                                (int)g_auto_form_vy_cms);
             return;
         }
         uint8_t shape = RNS_FORM_VEE;
@@ -2280,6 +2500,68 @@ static void handle_cli_command(char *line) {
                             ok ? 1U : 0U, (unsigned)fp.seq, (unsigned)fp.shape, (unsigned)fp.spacing_dm,
                             (long)fp.leader_lat_e7, (long)fp.leader_lon_e7,
                             (int)fp.vx_cms, (int)fp.vy_cms, (unsigned)fp.heading_cdeg);
+        return;
+    }
+
+    if (strcmp(cmd, "rns_multi") == 0) {
+        rns_multi_drone_pkt_t mp;
+        memset(&mp, 0, sizeof(mp));
+        mp.seq          = g_multi_seq++;
+        mp.ref_lat_e7   = (g_fc_tlm.lat_deg_e7 != 0) ? g_fc_tlm.lat_deg_e7 : -353632620L;
+        mp.ref_lon_e7   = (g_fc_tlm.lon_deg_e7 != 0) ? g_fc_tlm.lon_deg_e7 : 1491652370L;
+        mp.ref_alt_mm   = (g_fc_tlm.rel_alt_mm != 0) ? g_fc_tlm.rel_alt_mm : 25000L;
+        mp.heading_cdeg = g_fc_tlm.heading_cdeg;
+
+        for (uint8_t s = 0U; s < RNS_MULTI_MAX_SLOTS; s++) {
+            char *spec = strtok(NULL, " ");
+            if (spec == NULL) break;
+            if (strcasecmp(spec, "NOP") == 0 || strcmp(spec, "-") == 0) {
+                continue;
+            }
+            mp.slot_mask |= (uint8_t)(1U << s);
+            if (strncasecmp(spec, "OFS:", 4) == 0) {
+                float nm = 0.0f, em = 0.0f, dm = 0.0f;
+                const char *p = spec + 4;
+                nm = strtof(p, (char **)&p);
+                if (*p == ',') em = strtof(p + 1, (char **)&p);
+                if (*p == ',') dm = strtof(p + 1, NULL);
+                mp.slots[s].action   = RNS_MULTI_ACT_OFFSET_NED;
+                mp.slots[s].n_val_dm = (int16_t)(nm * 10.0f);
+                mp.slots[s].e_val_dm = (int16_t)(em * 10.0f);
+                mp.slots[s].d_val    = (int8_t)dm;
+            } else if (strncasecmp(spec, "VEL:", 4) == 0) {
+                float vn = 0.0f, ve = 0.0f, vd = 0.0f;
+                const char *p = spec + 4;
+                vn = strtof(p, (char **)&p);
+                if (*p == ',') ve = strtof(p + 1, (char **)&p);
+                if (*p == ',') vd = strtof(p + 1, NULL);
+                mp.slots[s].action   = RNS_MULTI_ACT_VEL_NED;
+                mp.slots[s].n_val_dm = (int16_t)(vn * 10.0f);
+                mp.slots[s].e_val_dm = (int16_t)(ve * 10.0f);
+                mp.slots[s].d_val    = (int8_t)(vd * 10.0f);
+            } else if (strcasecmp(spec, "LOITER") == 0) {
+                mp.slots[s].action = RNS_MULTI_ACT_LOITER;
+            } else if (strcasecmp(spec, "RTL") == 0) {
+                mp.slots[s].action = RNS_MULTI_ACT_RTL;
+            } else if (strcasecmp(spec, "LAND") == 0) {
+                mp.slots[s].action = RNS_MULTI_ACT_LAND;
+            } else if (strcasecmp(spec, "ARM") == 0) {
+                mp.slots[s].action = RNS_MULTI_ACT_ARM;
+            } else if (strcasecmp(spec, "DISARM") == 0) {
+                mp.slots[s].action = RNS_MULTI_ACT_DISARM;
+            } else {
+                mp.slot_mask &= (uint8_t)~(1U << s);
+            }
+        }
+        if (mp.slot_mask == 0U) {
+            hal_usb_uart_puts("ERR: usage: rns_multi <OFS:n,e,d | VEL:vn,ve,vd | LOITER | RTL | LAND | ARM | DISARM | NOP> [slot2] [slot3] [slot4]\r\n");
+            return;
+        }
+        uint8_t pkt[64];
+        size_t mlen = rns_build_multi_drone_pkt(&mp, pkt, sizeof(pkt));
+        bool ok = send_or_tunnel_rns_packet(pkt, (uint16_t)mlen);
+        hal_usb_uart_printf("OK RNS_MULTI_TX sent=%u seq=%u mask=0x%02X len=%u\r\n",
+                            ok ? 1U : 0U, (unsigned)mp.seq, (unsigned)mp.slot_mask, (unsigned)mlen);
         return;
     }
 
@@ -2624,8 +2906,12 @@ int main(void) {
             (void)rns_mav_parse_byte(&g_mav_parser, ub, &g_fc_tlm);
         }
 
-        /* 3. Handle RNode TX_DONE notification & incoming LoRa packets in RNODE / RELAY mode */
+        /* 3. Handle RNode TX_DONE notification, ELRS->LoRa burst completion & incoming LoRa packets */
         uint32_t now_ms = hal_millis();
+        if (g_elrs_lora_burst_done ||
+            (g_elrs_lora_burst_active && (uint32_t)(now_ms - g_elrs_lora_burst_start_ms) > 200U)) {
+            restore_elrs_rx_after_lora_burst();
+        }
         if (g_app_mode == APP_MODE_RNODE && g_rnode_next_frag_due_ms != 0U &&
             (int32_t)(now_ms - g_rnode_next_frag_due_ms) >= 0) {
             g_rnode_next_frag_due_ms = 0U;
@@ -2691,8 +2977,12 @@ int main(void) {
                     rns_relay_should_forward(&g_rns_relay, rx_copy, rx_len, now_ms)) {
                     memcpy(g_relay_tx_buf, rx_copy, rx_len);
                     g_relay_tx_len  = rx_len;
-                    uint32_t jitter = g_rns_relay.bounce_test_mode ? 0U : (uint32_t)(hal_micros() & 0x7FU);
-                    g_relay_due_ms  = now_ms + (uint32_t)g_rns_relay.forward_delay_ms + jitter;
+                    uint32_t delay  = rns_relay_compute_slot_delay_ms(&g_rns_relay,
+                                                                      rx_copy,
+                                                                      rx_len,
+                                                                      g_swarm_slot_id,
+                                                                      hal_micros());
+                    g_relay_due_ms  = now_ms + delay;
                     g_relay_pending = true;
                 }
                 hal_usb_uart_printf("RNS_RELAY_RX len=%u rssi=%ddBm snr=%ddB hops=%u ifac=%u fwd=%u exp=%u\r\n",
@@ -2713,14 +3003,23 @@ int main(void) {
             }
         }
 
-        if (g_app_mode == APP_MODE_RELAY && g_relay_pending &&
-            (int32_t)(now_ms - g_relay_due_ms) >= 0) {
-            g_relay_pending = false;
-            g_rnode_cfg.tx_bytes += g_relay_tx_len;
-            lr2021_tx_nb(g_relay_tx_buf, g_relay_tx_len);
-            hal_usb_uart_printf("RNS_RELAY_FWD len=%u hops=%u\r\n",
-                                g_relay_tx_len,
-                                (g_relay_tx_len > 1U) ? g_relay_tx_buf[1] : 0U);
+        if (g_relay_pending && (int32_t)(now_ms - g_relay_due_ms) >= 0) {
+            if (g_app_mode == APP_MODE_RELAY) {
+                g_relay_pending = false;
+                g_rnode_cfg.tx_bytes += g_relay_tx_len;
+                lr2021_tx_nb(g_relay_tx_buf, g_relay_tx_len);
+                hal_usb_uart_printf("RNS_RELAY_FWD len=%u hops=%u\r\n",
+                                    g_relay_tx_len,
+                                    (g_relay_tx_len > 1U) ? g_relay_tx_buf[1] : 0U);
+            } else if (g_app_mode == APP_MODE_ELRS_RX && !g_elrs_lora_burst_active) {
+                g_relay_pending = false;
+                start_elrs_lora_mesh_burst(g_relay_tx_buf, g_relay_tx_len);
+                hal_usb_uart_printf("RNS_HYBRID_BURST_TX len=%u hops=%u freq=%lu burst_cnt=%lu\r\n",
+                                    g_relay_tx_len,
+                                    (g_relay_tx_len > 1U) ? g_relay_tx_buf[1] : 0U,
+                                    (unsigned long)g_rnode_cfg.frequency_hz,
+                                    (unsigned long)g_elrs_lora_burst_count);
+            }
         }
 
         /* 4. Handle reassembled Reticulum packet or Over-the-Air CRSF frame from ExpressLRS DATA tunnel */
@@ -2794,11 +3093,41 @@ int main(void) {
                     if (rns_relay_should_forward(&g_rns_relay, relay_copy, tun_len, now_ms) && !g_relay_pending) {
                         memcpy(g_relay_tx_buf, relay_copy, tun_len);
                         g_relay_tx_len  = (uint8_t)tun_len;
-                        g_relay_due_ms  = now_ms + 80U + (uint32_t)(hal_micros() & 0x3FU);
+                        uint32_t delay  = (g_app_mode == APP_MODE_ELRS_RX)
+                                              ? 10U
+                                              : rns_relay_compute_slot_delay_ms(&g_rns_relay,
+                                                                                relay_copy,
+                                                                                tun_len,
+                                                                                g_swarm_slot_id,
+                                                                                hal_micros());
+                        g_relay_due_ms  = now_ms + delay;
                         g_relay_pending = true;
                     }
                 }
             }
+        }
+
+        /* 4a. Autonomous Leader Formation State Broadcast (rns_form auto ...) */
+        if (g_auto_form_interval_ms > 0U && (uint32_t)(now_ms - g_last_auto_form_ms) >= g_auto_form_interval_ms) {
+            g_last_auto_form_ms = now_ms;
+            rns_formation_pkt_t fp;
+            memset(&fp, 0, sizeof(fp));
+            memcpy(fp.leader_dest, g_rns_id.dest_hash, 16U);
+            fp.seq           = g_form_seq++;
+            fp.shape         = g_auto_form_shape;
+            fp.spacing_dm    = g_auto_form_spacing_dm;
+            fp.leader_lat_e7 = (g_fc_tlm.lat_deg_e7 != 0) ? g_fc_tlm.lat_deg_e7 : -353632620L;
+            fp.leader_lon_e7 = (g_fc_tlm.lon_deg_e7 != 0) ? g_fc_tlm.lon_deg_e7 : 1491652370L;
+            fp.leader_alt_mm = (g_fc_tlm.rel_alt_mm != 0) ? g_fc_tlm.rel_alt_mm : 25000L;
+            fp.vx_cms        = g_auto_form_vx_cms;
+            fp.vy_cms        = g_auto_form_vy_cms;
+            fp.heading_cdeg  = g_fc_tlm.heading_cdeg;
+            uint8_t fpkt[64];
+            size_t flen = rns_build_formation_pkt(&fp, fpkt, sizeof(fpkt));
+            bool ok = send_or_tunnel_rns_packet(fpkt, (uint16_t)flen);
+            hal_usb_uart_printf("RNS_FORM_AUTO_TX sent=%u seq=%u shape=%u spacing_dm=%u lat=%ld lon=%ld\r\n",
+                                ok ? 1U : 0U, (unsigned)fp.seq, (unsigned)fp.shape, (unsigned)fp.spacing_dm,
+                                (long)fp.leader_lat_e7, (long)fp.leader_lon_e7);
         }
 
         /* 4b. Mesh Control Dead-Man Watchdog (3.0s timeout -> automatic zero-velocity brake + LOITER) */

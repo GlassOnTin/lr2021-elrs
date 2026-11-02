@@ -66,7 +66,7 @@ cmake -B build -DCMAKE_TOOLCHAIN_FILE=firmware/toolchain-arm-none-eabi.cmake -DC
 cmake --build build -j$(nproc)
 ```
 
-### 2. Run Host Unit Tests (12 Suites, Including Embedded Lua 5.2 VM)
+### 2. Run Host Unit Tests (13 Suites, Including Embedded Lua 5.2 VM)
 ```bash
 mkdir -p build_host
 g++ -std=c++17 -O2 -Wall -Wextra -I. \

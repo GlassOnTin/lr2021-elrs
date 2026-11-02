@@ -51,6 +51,10 @@ extern "C" {
 #define CRSF_RNS_ACT_LAND               0x05U
 #define CRSF_RNS_ACT_ARM                0x06U
 #define CRSF_RNS_ACT_DISARM             0x07U
+#define CRSF_RNS_ACT_FORM_VEE           0x08U
+#define CRSF_RNS_ACT_FORM_LINE          0x09U
+#define CRSF_RNS_ACT_FORM_COL           0x0AU
+#define CRSF_RNS_ACT_FORM_HOLD          0x0BU
 
 typedef struct {
     uint8_t  tx_dest[16];

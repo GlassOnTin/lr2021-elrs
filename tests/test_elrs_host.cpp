@@ -1121,12 +1121,12 @@ static void test_edgetx_lua_script_end_to_end(void) {
                                      &dest, &orig, &subcmd, &pay, &pay_len));
     assert(subcmd == CRSF_RNS_SUBCMD_SELECT_PEER && pay_len == 1U && pay[0] == 0U);
 
-    /* 5. Switch to Page 4 (Targeted RX Cmd): press all 6 action buttons (Ping RX, LOITER, RTL, LAND, ARM, DISARM) */
+    /* 5. Switch to Page 4 (Targeted RX Cmd): press all 9 action buttons (Ping RX..DISARM + Form:VEE/LINE/HOLD) */
     g_lua_harness.tx_frames.clear();
     const char *lua_page4 = R"LUA(
       LCD_W = 480
       tool.run(EVT_VIRTUAL_NEXT_PAGE)
-      for i = 1, 6 do
+      for i = 1, 9 do
         tool.run(EVT_VIRTUAL_ENTER)
         tool.run(EVT_VIRTUAL_NEXT)
       end
@@ -1134,13 +1134,17 @@ static void test_edgetx_lua_script_end_to_end(void) {
     assert(p_luaL_loadstring(L, lua_page4) == 0);
     assert(p_lua_pcallk(L, 0, 0, 0, 0, NULL) == 0);
     assert(lcd_contains("Ping RTT:34ms  TunTX:19 TunRX:18 Rly:5"));
+    assert(lcd_contains("[Form:VEE]"));
+    assert(lcd_contains("[Form:LINE]"));
+    assert(lcd_contains("[Form:HOLD]"));
     assert(lcd_contains("OK (0x06)"));
-    assert(g_lua_harness.tx_frames.size() == 6U);
-    const uint8_t expected_acts[6] = {
-        CRSF_RNS_ACT_PING, CRSF_RNS_ACT_LOITER, CRSF_RNS_ACT_RTL,
-        CRSF_RNS_ACT_LAND, CRSF_RNS_ACT_ARM,    CRSF_RNS_ACT_DISARM
+    assert(g_lua_harness.tx_frames.size() == 9U);
+    const uint8_t expected_acts[9] = {
+        CRSF_RNS_ACT_PING,     CRSF_RNS_ACT_LOITER,    CRSF_RNS_ACT_RTL,
+        CRSF_RNS_ACT_LAND,     CRSF_RNS_ACT_ARM,       CRSF_RNS_ACT_DISARM,
+        CRSF_RNS_ACT_FORM_VEE, CRSF_RNS_ACT_FORM_LINE, CRSF_RNS_ACT_FORM_HOLD
     };
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < 9; i++) {
         assert(crsf_decode_rns_cmd_frame(g_lua_harness.tx_frames[i].data(), g_lua_harness.tx_frames[i].size(),
                                          &dest, &orig, &subcmd, &pay, &pay_len));
         assert(subcmd == CRSF_RNS_SUBCMD_ACTION && pay_len == 1U && pay[0] == expected_acts[i]);
@@ -1329,6 +1333,85 @@ static void test_multi_drone_mesh_and_formation(void) {
     printf("[PASS] test_multi_drone_mesh_and_formation (RNSF 64B formation + ping-pong hop/TTL chain + MAVLink #84/#86)\n");
 }
 
+/* ---------------------------------------------------------------------------
+ * 13. Deterministic Slot-TDMA Relay & 64B Multi-Drone Bundle ("RNSM") Test
+ * --------------------------------------------------------------------------- */
+static void test_slot_tdma_and_multi_drone_bundle(void) {
+    /* 1. Build a 64B RNSM packet with 4 independent drone slot commands */
+    rns_multi_drone_pkt_t mp = {};
+    mp.seq          = 19U;
+    mp.slot_mask    = 0x0FU;         /* Slots 1..4 all active */
+    mp.ref_lat_e7   = -353632620L;
+    mp.ref_lon_e7   = 1491652370L;
+    mp.ref_alt_mm   = 20000L;        /* 20.0 m reference altitude */
+    mp.heading_cdeg = 9000U;         /* 90.0 deg heading */
+
+    /* Slot 1: 3D NED offset (-10.0m N, -15.0m E, +5m Alt) -> #86 GLOBAL_POS_VEL */
+    mp.slots[0].action   = RNS_MULTI_ACT_OFFSET_NED;
+    mp.slots[0].n_val_dm = -100;
+    mp.slots[0].e_val_dm = -150;
+    mp.slots[0].d_val    = 5;
+
+    /* Slot 2: NED velocity vector (+5.0 m/s N, -2.0 m/s E, -1.0 m/s D) -> #84 VEL_NED */
+    mp.slots[1].action   = RNS_MULTI_ACT_VEL_NED;
+    mp.slots[1].n_val_dm = 50;
+    mp.slots[1].e_val_dm = -20;
+    mp.slots[1].d_val    = -10;
+
+    /* Slot 3: LOITER -> #76 COMMAND_LONG (MAV_CMD_NAV_LOITER_UNLIM) */
+    mp.slots[2].action   = RNS_MULTI_ACT_LOITER;
+
+    /* Slot 4: RTL -> #76 COMMAND_LONG (MAV_CMD_NAV_RETURN_TO_LAUNCH) */
+    mp.slots[3].action   = RNS_MULTI_ACT_RTL;
+
+    uint8_t raw[64];
+    size_t len = rns_build_multi_drone_pkt(&mp, raw, sizeof(raw));
+    assert(len == 64U);
+    assert(raw[18] == 0xA8U && memcmp(&raw[19], "RNSM", 4U) == 0);
+
+    /* 2. Verify Deterministic Slot-TDMA Relay Scheduling (`Slots 1..4` -> 0, 45, 90, 135 ms) */
+    rns_relay_table_t rt;
+    rns_relay_init(&rt);
+    assert(rns_relay_compute_slot_delay_ms(&rt, raw, len, 1U, 0x5AU) == 0UL);
+    assert(rns_relay_compute_slot_delay_ms(&rt, raw, len, 2U, 0x5AU) == 45UL);
+    assert(rns_relay_compute_slot_delay_ms(&rt, raw, len, 3U, 0x5AU) == 90UL);
+    assert(rns_relay_compute_slot_delay_ms(&rt, raw, len, 4U, 0x5AU) == 135UL);
+    /* Slot 0 (Leader) or non-swarm packets fall back to CSMA jitter (120 + (0x5A & 0x7F) = 210 ms) */
+    assert(rns_relay_compute_slot_delay_ms(&rt, raw, len, 0U, 0x5AU) == 210UL);
+
+    /* 3. Forward RNSM across 2 relay hops and verify SHA-256 tag still validates */
+    assert(rns_relay_should_forward(&rt, raw, len, 500U));
+    assert(raw[1] == 1U);
+
+    rns_multi_drone_pkt_t rx_mp = {};
+    assert(rns_parse_multi_drone_pkt(raw, len, &rx_mp));
+    assert(rx_mp.seq == 19U && rx_mp.slot_mask == 0x0FU);
+    assert(rx_mp.ref_lat_e7 == -353632620L && rx_mp.ref_alt_mm == 20000L);
+
+    /* Extract per-slot commands for Slots 1..4 */
+    rns_drone_cmd_t c1, c2, c3, c4;
+    assert(rns_extract_multi_slot_cmd(&rx_mp, 1U, &c1));
+    assert(c1.type == RNS_DRONE_CMD_GLOBAL_POS_VEL);
+    assert(c1.lat_deg_e7 < rx_mp.ref_lat_e7 && c1.lon_deg_e7 < rx_mp.ref_lon_e7);
+    assert(c1.alt_m == 25); /* 20m ref + 5m offset */
+
+    assert(rns_extract_multi_slot_cmd(&rx_mp, 2U, &c2));
+    assert(c2.type == RNS_DRONE_CMD_VEL_NED);
+    assert(c2.vx_cms == 500 && c2.vy_cms == -200 && c2.vz_cms == -100);
+
+    assert(rns_extract_multi_slot_cmd(&rx_mp, 3U, &c3));
+    assert(c3.type == RNS_DRONE_CMD_LOITER);
+
+    assert(rns_extract_multi_slot_cmd(&rx_mp, 4U, &c4));
+    assert(c4.type == RNS_DRONE_CMD_RTL);
+
+    /* Corrupt 1 byte in payload and verify SHA-256 tag rejects it */
+    raw[40] ^= 0x01U;
+    assert(!rns_parse_multi_drone_pkt(raw, len, &rx_mp));
+
+    printf("[PASS] test_slot_tdma_and_multi_drone_bundle (Deterministic Slot-TDMA + 64B RNSM multi-slot bundle)\n");
+}
+
 int main(void) {
     test_uid_md5();
     test_fhss_invariants();
@@ -1342,6 +1425,7 @@ int main(void) {
     test_rns_identity_pairing_and_lua_crsf();
     test_edgetx_lua_script_end_to_end();
     test_multi_drone_mesh_and_formation();
+    test_slot_tdma_and_multi_drone_bundle();
     printf("All host unit tests PASSED.\n");
     return 0;
 }

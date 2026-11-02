@@ -155,10 +155,11 @@ size_t rnode_build_phyprm(uint32_t bw_hz, uint8_t sf, uint16_t preamble_sym,
 void rns_relay_init(rns_relay_table_t *t) {
     if (t == NULL) return;
     memset(t, 0, sizeof(*t));
-    t->max_hops         = 128U;
-    t->forward_delay_ms = 120U;
-    t->dedup_window_ms  = RNS_DEDUP_WINDOW_MS;
-    t->bounce_test_mode = false;
+    t->max_hops            = 128U;
+    t->forward_delay_ms    = 120U;
+    t->slot_tdma_window_ms = 45U;
+    t->dedup_window_ms     = RNS_DEDUP_WINDOW_MS;
+    t->bounce_test_mode    = false;
 }
 
 void rns_relay_configure_chain_test(rns_relay_table_t *t,
@@ -168,15 +169,39 @@ void rns_relay_configure_chain_test(rns_relay_table_t *t,
                                     uint32_t ttl_window_ms) {
     if (t == NULL) return;
     memset(t->ring, 0, sizeof(t->ring));
-    t->head             = 0U;
-    t->bounce_test_mode = bounce_enable;
-    t->max_hops         = (max_hops == 0U || max_hops > 62U) ? (bounce_enable ? 4U : 128U) : max_hops;
-    t->forward_delay_ms = (forward_delay_ms == 0U) ? 120U : forward_delay_ms;
-    t->dedup_window_ms   = (ttl_window_ms == 0UL) ? RNS_DEDUP_WINDOW_MS : ttl_window_ms;
-    t->last_rx_expired   = false;
-    t->relayed_count     = 0U;
-    t->dropped_dup_count = 0U;
-    t->expired_hop_count = 0U;
+    t->head                = 0U;
+    t->bounce_test_mode    = bounce_enable;
+    t->max_hops            = (max_hops == 0U || max_hops > 62U) ? (bounce_enable ? 4U : 128U) : max_hops;
+    t->forward_delay_ms    = (forward_delay_ms == 0U) ? 120U : forward_delay_ms;
+    if (t->slot_tdma_window_ms == 0U) {
+        t->slot_tdma_window_ms = 45U;
+    }
+    t->dedup_window_ms     = (ttl_window_ms == 0UL) ? RNS_DEDUP_WINDOW_MS : ttl_window_ms;
+    t->last_rx_expired     = false;
+    t->relayed_count       = 0U;
+    t->dropped_dup_count   = 0U;
+    t->expired_hop_count   = 0U;
+}
+
+uint32_t rns_relay_compute_slot_delay_ms(const rns_relay_table_t *t,
+                                         const uint8_t *pkt,
+                                         size_t len,
+                                         uint8_t slot_id,
+                                         uint32_t rand_bits) {
+    if (t == NULL) {
+        return 120U + (rand_bits & 0x7FU);
+    }
+    if (t->bounce_test_mode) {
+        return (uint32_t)t->forward_delay_ms;
+    }
+    bool is_swarm_pkt = (pkt != NULL && len >= 23U &&
+                         ((pkt[18] == 0xA7U && memcmp(&pkt[19], "RNSF", 4U) == 0) ||
+                          (pkt[18] == 0xA8U && memcmp(&pkt[19], "RNSM", 4U) == 0)));
+    if (is_swarm_pkt && slot_id >= 1U && slot_id <= 7U) {
+        uint32_t win_ms = (t->slot_tdma_window_ms > 0U) ? (uint32_t)t->slot_tdma_window_ms : 45UL;
+        return (uint32_t)(slot_id - 1U) * win_ms;
+    }
+    return (uint32_t)t->forward_delay_ms + (rand_bits & 0x7FU);
 }
 
 /* Computes a 64-bit FNV-1a invariant hash over the Reticulum packet:
@@ -1578,5 +1603,138 @@ bool rns_compute_formation_slot_cmd(const rns_formation_pkt_t *fp,
     out_cmd->vz_cms       = fp->vz_cms;
     out_cmd->heading_cdeg = fp->heading_cdeg;
     return true;
+}
+
+/* ---------------------------------------------------------------------------
+ * 7. Combined Multi-Drone Command & 3D Offset Bundle ("RNSM" context 0xA8)
+ * --------------------------------------------------------------------------- */
+size_t rns_build_multi_drone_pkt(const rns_multi_drone_pkt_t *mp,
+                                 uint8_t *out_pkt,
+                                 size_t max_len) {
+    if (mp == NULL || out_pkt == NULL || max_len < 64U) {
+        return 0U;
+    }
+    memset(out_pkt, 0, 64U);
+    out_pkt[0] = 0x08U; /* HEADER_1 | BROADCAST | PLAIN | DATA */
+    out_pkt[1] = 0x00U; /* hops = 0 */
+    memcpy(&out_pkt[2], RNS_DEST_DRONE_CMD, 16U);
+    out_pkt[18] = 0xA8U; /* Multi-drone bundle context */
+
+    memcpy(&out_pkt[19], "RNSM", 4U);
+    out_pkt[23] = mp->seq;
+    out_pkt[24] = (uint8_t)(mp->slot_mask & 0x0FU);
+    write_u32_le(&out_pkt[25], (uint32_t)mp->ref_lat_e7);
+    write_u32_le(&out_pkt[29], (uint32_t)mp->ref_lon_e7);
+    int16_t alt_dm = (int16_t)(mp->ref_alt_mm / 100L);
+    write_u16_le(&out_pkt[33], (uint16_t)alt_dm);
+    write_u16_le(&out_pkt[35], mp->heading_cdeg);
+
+    for (uint8_t i = 0U; i < RNS_MULTI_MAX_SLOTS; i++) {
+        size_t base = 37U + (size_t)i * 6U;
+        out_pkt[base + 0U] = mp->slots[i].action;
+        write_u16_le(&out_pkt[base + 1U], (uint16_t)mp->slots[i].n_val_dm);
+        write_u16_le(&out_pkt[base + 3U], (uint16_t)mp->slots[i].e_val_dm);
+        out_pkt[base + 5U] = (uint8_t)mp->slots[i].d_val;
+    }
+    out_pkt[61] = 0U;
+
+    uint8_t digest[32];
+    rns_sha256(&out_pkt[2], 60U, digest);
+    out_pkt[62] = digest[0];
+    out_pkt[63] = digest[1];
+    return 64U;
+}
+
+bool rns_parse_multi_drone_pkt(const uint8_t *pkt,
+                               size_t len,
+                               rns_multi_drone_pkt_t *out_mp) {
+    if (pkt == NULL || out_mp == NULL || len < 64U) {
+        return false;
+    }
+    if (pkt[18] != 0xA8U || memcmp(&pkt[19], "RNSM", 4U) != 0 ||
+        memcmp(&pkt[2], RNS_DEST_DRONE_CMD, 16U) != 0) {
+        return false;
+    }
+    uint8_t digest[32];
+    rns_sha256(&pkt[2], 60U, digest);
+    if (pkt[62] != digest[0] || pkt[63] != digest[1]) {
+        return false;
+    }
+
+    memset(out_mp, 0, sizeof(*out_mp));
+    out_mp->seq          = pkt[23];
+    out_mp->slot_mask    = (uint8_t)(pkt[24] & 0x0FU);
+    out_mp->ref_lat_e7   = (int32_t)read_u32_le(&pkt[25]);
+    out_mp->ref_lon_e7   = (int32_t)read_u32_le(&pkt[29]);
+    out_mp->ref_alt_mm   = (int32_t)((int16_t)read_u16_le(&pkt[33])) * 100L;
+    out_mp->heading_cdeg = read_u16_le(&pkt[35]);
+
+    for (uint8_t i = 0U; i < RNS_MULTI_MAX_SLOTS; i++) {
+        size_t base = 37U + (size_t)i * 6U;
+        out_mp->slots[i].action   = pkt[base + 0U];
+        out_mp->slots[i].n_val_dm = (int16_t)read_u16_le(&pkt[base + 1U]);
+        out_mp->slots[i].e_val_dm = (int16_t)read_u16_le(&pkt[base + 3U]);
+        out_mp->slots[i].d_val    = (int8_t)pkt[base + 5U];
+    }
+    return true;
+}
+
+bool rns_extract_multi_slot_cmd(const rns_multi_drone_pkt_t *mp,
+                                uint8_t slot_id,
+                                rns_drone_cmd_t *out_cmd) {
+    if (mp == NULL || out_cmd == NULL || slot_id < 1U || slot_id > RNS_MULTI_MAX_SLOTS) {
+        return false;
+    }
+    uint8_t idx = (uint8_t)(slot_id - 1U);
+    if ((mp->slot_mask & (uint8_t)(1U << idx)) == 0U) {
+        return false;
+    }
+    const rns_multi_slot_desc_t *sd = &mp->slots[idx];
+    memset(out_cmd, 0, sizeof(*out_cmd));
+
+    switch (sd->action) {
+        case RNS_MULTI_ACT_OFFSET_NED: {
+            float offset_n_m = (float)sd->n_val_dm * 0.1f;
+            float offset_e_m = (float)sd->e_val_dm * 0.1f;
+            float lat_rad    = ((float)mp->ref_lat_e7 * 1e-7f) * (3.1415926535f / 180.0f);
+            float cos_lat    = cosf(lat_rad);
+            if (cos_lat < 0.1f) {
+                cos_lat = 0.1f;
+            }
+            int32_t dlat_e7 = (int32_t)(offset_n_m * 89.831528f);
+            int32_t dlon_e7 = (int32_t)((offset_e_m * 89.831528f) / cos_lat);
+
+            out_cmd->type         = RNS_DRONE_CMD_GLOBAL_POS_VEL;
+            out_cmd->lat_deg_e7   = mp->ref_lat_e7 + dlat_e7;
+            out_cmd->lon_deg_e7   = mp->ref_lon_e7 + dlon_e7;
+            out_cmd->alt_m        = (mp->ref_alt_mm / 1000L) + (int32_t)sd->d_val;
+            out_cmd->heading_cdeg = mp->heading_cdeg;
+            return true;
+        }
+        case RNS_MULTI_ACT_VEL_NED:
+            out_cmd->type           = RNS_DRONE_CMD_VEL_NED;
+            out_cmd->vx_cms         = (int16_t)(sd->n_val_dm * 10);
+            out_cmd->vy_cms         = (int16_t)(sd->e_val_dm * 10);
+            out_cmd->vz_cms         = (int16_t)sd->d_val * 10;
+            out_cmd->use_body_frame = false;
+            return true;
+        case RNS_MULTI_ACT_LOITER:
+            out_cmd->type = RNS_DRONE_CMD_LOITER;
+            return true;
+        case RNS_MULTI_ACT_RTL:
+            out_cmd->type = RNS_DRONE_CMD_RTL;
+            return true;
+        case RNS_MULTI_ACT_LAND:
+            out_cmd->type = RNS_DRONE_CMD_LAND;
+            return true;
+        case RNS_MULTI_ACT_ARM:
+            out_cmd->type = RNS_DRONE_CMD_ARM;
+            return true;
+        case RNS_MULTI_ACT_DISARM:
+            out_cmd->type = RNS_DRONE_CMD_DISARM;
+            return true;
+        default:
+            return false;
+    }
 }
 

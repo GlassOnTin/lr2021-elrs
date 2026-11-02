@@ -148,6 +148,11 @@ When operating in `RELAY` mode on the drone:
 - **Multi-Drone Formation Broadcast (`RNSF`, Context `0xA7`, 64 Bytes):**
   - `rns_build_formation_pkt()` packs `[0..18]` Reticulum header (`0x08`, `hops`, `RNS_DEST_DRONE_CMD`, `0xA7`), `[19..22]` `"RNSF"`, `[23..38]` `leader_dest` (16B), `[39]` `seq`, `[40]` `shape` (`HOLD = 0`, `LINE = 1`, `VEE = 2`, `COLUMN = 3`), `[41..42]` `spacing_dm`, `[43..46]` `leader_lat_e7`, `[47..50]` `leader_lon_e7`, `[51..52]` `leader_alt_dm`, `[53..54]` `vx_cms`, `[55..56]` `vy_cms`, `[57..58]` `vz_cms`, `[59..60]` `heading_cdeg`, and `[62..63]` 2-byte SHA-256 tag over bytes `[2..61]`.
   - Followers compute their rotated slot offset via `rns_compute_formation_slot_cmd()` and emit a 65-byte MAVLink v2 `SET_POSITION_TARGET_GLOBAL_INT` (`msgid = 86`, `CRC_EXTRA = 5`, `mask = 0x09C0`, `frame = GLOBAL_RELATIVE_ALT_INT (6)`). A 3.0 s dead-man watchdog (`RNS_MESH_WATCHDOG_MS = 3000`) emits `MAV_CMD_NAV_LOITER_UNLIM` if updates stop.
+- **Combined Multi-Drone Command Bundle (`RNSM`, Context `0xA8`, 64 Bytes):**
+  - `rns_build_multi_drone_pkt()` packs independent per-slot commands/3D offsets for up to 4 follower slots (`Slots 1..4`) into a single 64-byte frame (`[19..22]` `"RNSM"`, `[23]` `seq`, `[24]` `slot_mask`, `[25..36]` reference `lat_e7`/`lon_e7`/`alt_dm`/`heading_cdeg`, `[37..60]` four 6-byte slot descriptors `[action, n_val_dm, e_val_dm, d_val]`, and `[62..63]` 2-byte SHA-256 tag).
+- **Deterministic Slot-TDMA Relay & Hybrid `ELRS_RX` LoRa Burst:**
+  - When relaying `RNSF` (`0xA7`) or `RNSM` (`0xA8`) packets, followers in `rns_slot 1..7` schedule their rebroadcast at `(slot_id - 1) * 45 ms` (`rns_relay_compute_slot_delay_ms()`) instead of random CSMA jitter.
+  - When a Lead Drone is in `ELRS_RX` mode locked to a 200 Hz FHSS link, `start_elrs_lora_mesh_burst()` injects 64-byte `RNSF`/`RNSM` LoRa bursts onto the 868 MHz mesh while `TIMER20` continues advancing `OtaNonce` and `FHSS` hops in lockstep, immediately restoring FHSS reception on `TX_DONE`.
 
 ```mermaid
 sequenceDiagram

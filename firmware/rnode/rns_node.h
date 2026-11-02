@@ -128,6 +128,7 @@ typedef struct {
     uint8_t           head;
     uint8_t           max_hops;
     uint16_t          forward_delay_ms;
+    uint16_t          slot_tdma_window_ms;
     uint32_t          dedup_window_ms;
     bool              bounce_test_mode;
     bool              last_rx_expired;
@@ -142,6 +143,11 @@ void rns_relay_configure_chain_test(rns_relay_table_t *t,
                                     uint8_t max_hops,
                                     uint16_t forward_delay_ms,
                                     uint32_t ttl_window_ms);
+uint32_t rns_relay_compute_slot_delay_ms(const rns_relay_table_t *t,
+                                         const uint8_t *pkt,
+                                         size_t len,
+                                         uint8_t slot_id,
+                                         uint32_t rand_bits);
 uint64_t rns_packet_invariant_hash(const uint8_t *pkt, size_t len);
 
 /* Returns true if the packet should be relayed and prepares `inout_pkt`
@@ -445,6 +451,49 @@ bool rns_parse_formation_pkt(const uint8_t *pkt,
 bool rns_compute_formation_slot_cmd(const rns_formation_pkt_t *f,
                                     uint8_t slot_id,
                                     rns_drone_cmd_t *out_cmd);
+
+/* Multi-drone independent command & 3D offset bundle (RNSM, context 0xA8, 64 bytes) */
+#define RNS_MULTI_MAX_SLOTS     4U
+
+typedef enum {
+    RNS_MULTI_ACT_NOP        = 0,
+    RNS_MULTI_ACT_OFFSET_NED = 1, /* n_val_dm (0.1m), e_val_dm (0.1m), d_val (1m alt) -> #86 GLOBAL_POS_VEL */
+    RNS_MULTI_ACT_VEL_NED    = 2, /* n_val_dm (0.1m/s), e_val_dm (0.1m/s), d_val (0.1m/s) -> #84 VEL_NED */
+    RNS_MULTI_ACT_LOITER     = 3,
+    RNS_MULTI_ACT_RTL        = 4,
+    RNS_MULTI_ACT_LAND       = 5,
+    RNS_MULTI_ACT_ARM        = 6,
+    RNS_MULTI_ACT_DISARM     = 7
+} rns_multi_slot_action_t;
+
+typedef struct {
+    uint8_t action;    /* rns_multi_slot_action_t */
+    int16_t n_val_dm;  /* North offset in 0.1 m (dm) OR North velocity in 0.1 m/s (dm/s) */
+    int16_t e_val_dm;  /* East offset in 0.1 m (dm)  OR East velocity in 0.1 m/s (dm/s) */
+    int8_t  d_val;     /* Alt offset in m (+up/-down) OR Down velocity in 0.1 m/s (dm/s) */
+} rns_multi_slot_desc_t;
+
+typedef struct {
+    uint8_t               seq;
+    uint8_t               slot_mask;    /* Bit b (0..3) set if slots[b] (Drone Slot 1..4) is active */
+    int32_t               ref_lat_e7;   /* Reference / Leader latitude * 1e7 */
+    int32_t               ref_lon_e7;   /* Reference / Leader longitude * 1e7 */
+    int32_t               ref_alt_mm;   /* Reference / Leader relative altitude in mm */
+    uint16_t              heading_cdeg; /* Reference heading in centi-degrees (0..35999) */
+    rns_multi_slot_desc_t slots[RNS_MULTI_MAX_SLOTS]; /* Index 0..3 -> Drone Slot 1..4 */
+} rns_multi_drone_pkt_t;
+
+size_t rns_build_multi_drone_pkt(const rns_multi_drone_pkt_t *mp,
+                                 uint8_t *out_pkt,
+                                 size_t max_len);
+
+bool rns_parse_multi_drone_pkt(const uint8_t *pkt,
+                               size_t len,
+                               rns_multi_drone_pkt_t *out_mp);
+
+bool rns_extract_multi_slot_cmd(const rns_multi_drone_pkt_t *mp,
+                                uint8_t slot_id,
+                                rns_drone_cmd_t *out_cmd);
 
 #ifdef __cplusplus
 }
