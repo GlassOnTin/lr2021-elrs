@@ -6,6 +6,30 @@ This document covers the hardware interface on the [Seeed Studio Semtech LR2021 
 
 ## 1. Hardware Architecture (`XIAO nRF54L15` + `Wio-LR2021`)
 
+### 1.0 Pin Mapping & RF Limits
+
+- **Evaluation Kit**: [Seeed Studio Semtech LR2021 LoRa Plus Evaluation Kit (868 MHz EU)](https://www.seeedstudio.com/LR2021-LoRa-Plus-Evaluation-kit-868Mhz-EU-V2-0-p-6697.html) / [915 MHz US](https://www.seeedstudio.com/LR2021-LoRa-Plus-Evaluation-kit-915Mhz-US-V2-0-p-6698.html) ([Seeed Wiki](https://wiki.seeedstudio.com/semtech_lr2021_evk_getting_started/))
+- **MCU Board**: Seeed Studio XIAO nRF54L15 (`nRF54L15-QFAA`, ARM Cortex-M33 @ 128 MHz, 1.5 MB RRAM, 256 KB SRAM)
+- **Radio Board**: [Seeed Studio Wio-LR2021](https://www.seeedstudio.com/Seeed-Studio-Wio-LR2021-Wireless-module-868-915MHz-Tape-reel-p-6831.html) (`LR2021EVK1XBS1_XIAO`, Semtech LR2021 Rev B `0x0118`)
+- **Oscillator**: Passive 32 MHz crystal (`has_tcxo = false`). Do not send `SET_TCXO_MODE` (`0x0120`) on this board; it disables the crystal oscillator and raises `HF_XOSC_START_ERR` (`0x0001`).
+- **RF Input Limit**: Maximum +10 dBm at the SMA ports (`ANT_LF` and `ANT_HF`). Attach antennas before transmitting.
+
+| Function | XIAO Pin | nRF54L15 GPIO | Peripheral / Notes |
+|---|---|---|---|
+| `SPI_SCK` | `D8` | `P2.01` | `SPIM00` @ 8 MHz |
+| `SPI_MOSI` | `D10` | `P2.02` | `SPIM00` |
+| `SPI_MISO` | `D9` | `P2.04` | `SPIM00` |
+| `RADIO_NSS` | `D3` | `P1.07` | Active-low chip select |
+| `RADIO_RST` | `D2` | `P1.06` | Active-low reset |
+| `RADIO_BUSY` | `D1` | `P1.05` | Active-high busy input |
+| `RADIO_IRQ` (`DIO8`) | `D0` | `P1.04` | `GPIOTE20` rising-edge interrupt |
+| `USB_CDC_TX` | SAMD11 bridge | `P1.09` | `UARTE22` @ 115200 8N1 |
+| `USB_CDC_RX` | SAMD11 bridge | `P1.08` | `UARTE22` @ 115200 8N1 |
+| `CRSF_TX` / `FC_TX` | `D6` (Grove TX) | `P2.08` | `UARTE21` @ 420000 / 115200 8N1 (to FC RX) |
+| `CRSF_RX` / `FC_RX` | `D7` (Grove RX) | `P2.07` | `UARTE21` @ 420000 / 115200 8N1 (from FC TX or Handset) |
+| `USER_LED` | Built-in | `P2.00` | Active-low status LED |
+| `USR_BTN` | Built-in | `P0.00` | Active-low user button |
+
 ### 1.1 MCU Clock and Timer Domains
 
 The Nordic `nRF54L15` runs on its 128 MHz CPU clock with three separate peripheral domains (`PERI00`, `PERI10`, `PERI20`), each clocked differently:
@@ -78,6 +102,10 @@ When operating in `RELAY` mode on the drone:
   - `GOTO <lat_e7> <lon_e7> <alt_m>` -> 49-byte MAVLink v2 `MISSION_ITEM_INT` (`msgid = 73`, `MAV_CMD_NAV_WAYPOINT = 16`, `current = 2` guided mode target, `frame = MAV_FRAME_GLOBAL_RELATIVE_ALT_INT`).
   - `RTL`, `LOITER`, `LAND`, `ARM`, `DISARM`, `MODE <custom_mode>` -> 45-byte MAVLink v2 `COMMAND_LONG` (`msgid = 76`, `MAV_CMD_NAV_RETURN_TO_LAUNCH = 20`, `MAV_CMD_NAV_LOITER_UNLIM = 17`, `MAV_CMD_NAV_LAND = 21`, `MAV_CMD_COMPONENT_ARM_DISARM = 400`, `MAV_CMD_DO_SET_MODE = 176`).
   - `RC <ch1_us> <ch2_us> <ch3_us> <ch4_us>` -> Updates local CRSF RC channels AND emits a 30-byte MAVLink v2 `RC_CHANNELS_OVERRIDE` (`msgid = 70`, `CRC_EXTRA = 124`) frame (`RC 0 0 0 0` releases the MAVLink RC override back to the hardware RC receiver).
+  - `VEL <vn_cms> <ve_cms> <vd_cms> [yaw_rate_cdps]` and `BVL <vx_cms> <vy_cms> <vz_cms> [yaw_rate_cdps]` -> 65-byte MAVLink v2 `SET_POSITION_TARGET_LOCAL_NED` (`msgid = 84`, `CRC_EXTRA = 143`, `mask = 0x0DC7` velocity-only or `0x05C7` velocity + yaw rate, `frame = LOCAL_NED (1)` or `BODY_OFFSET_NED (9)`).
+- **Multi-Drone Formation Broadcast (`RNSF`, Context `0xA7`, 64 Bytes):**
+  - `rns_build_formation_pkt()` packs `[0..18]` Reticulum header (`0x08`, `hops`, `RNS_DEST_DRONE_CMD`, `0xA7`), `[19..22]` `"RNSF"`, `[23..38]` `leader_dest` (16B), `[39]` `seq`, `[40]` `shape` (`HOLD = 0`, `LINE = 1`, `VEE = 2`, `COLUMN = 3`), `[41..42]` `spacing_dm`, `[43..46]` `leader_lat_e7`, `[47..50]` `leader_lon_e7`, `[51..52]` `leader_alt_dm`, `[53..54]` `vx_cms`, `[55..56]` `vy_cms`, `[57..58]` `vz_cms`, `[59..60]` `heading_cdeg`, and `[62..63]` 2-byte SHA-256 tag over bytes `[2..61]`.
+  - Followers compute their rotated slot offset via `rns_compute_formation_slot_cmd()` and emit a 65-byte MAVLink v2 `SET_POSITION_TARGET_GLOBAL_INT` (`msgid = 86`, `CRC_EXTRA = 5`, `mask = 0x09C0`, `frame = GLOBAL_RELATIVE_ALT_INT (6)`). A 3.0 s dead-man watchdog (`RNS_MESH_WATCHDOG_MS = 3000`) emits `MAV_CMD_NAV_LOITER_UNLIM` if updates stop.
 
 ### 2.5 ExpressLRS `ELRS_PKT_TYPE_DATA` (`0x01`) FHSS Tunnel
 
