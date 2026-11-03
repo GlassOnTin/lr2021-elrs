@@ -1,0 +1,24 @@
+idf_component_register(
+    SRCS
+        "p4_main.cpp"
+        "../../../firmware/elrs/elrs_protocol.cpp"
+        "../../../firmware/crsf/crsf.cpp"
+        "../../../firmware/rnode/rns_node.cpp"
+        "../../../firmware/p4_trx/p4_trx_core.cpp"
+    INCLUDE_DIRS
+        "."
+        "../../../firmware/elrs"
+        "../../../firmware/crsf"
+        "../../../firmware/rnode"
+        "../../../firmware/p4_trx"
+        "../../../firmware/radio"
+    REQUIRES
+        driver
+        esp_lcd
+        esp_mm
+        esp_psram
+        esp_timer
+        efuse
+        soc
+        hal
+)

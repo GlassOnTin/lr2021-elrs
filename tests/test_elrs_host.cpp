@@ -5,6 +5,7 @@
 #include "../firmware/crsf/crsf.h"
 #include "../firmware/rnode/rns_node.h"
 #include "../firmware/radio/lr1121_driver.h"
+#include "../firmware/p4_trx/p4_trx_core.h"
 
 #include <assert.h>
 #include <dlfcn.h>
@@ -1614,6 +1615,171 @@ static void test_xr4_lr1121_dual_radio_and_bridge(void) {
     printf("[PASS] test_xr4_lr1121_dual_radio_and_bridge (RadioMaster XR4 2x LR1121 simultaneous 2.4GHz ELRS + 868MHz RNS mesh)\n");
 }
 
+static void test_t_display_p4_trx_unit(void) {
+    p4_trx_state_t p4;
+    const uint8_t p4_hw_id[8] = {0x30, 0x3A, 0x40, 0x01, 0x50, 0x34, 0x20, 0x21};
+    p4_trx_init(&p4, P4_PANEL_HI8561_TFT, "WinniePico", p4_hw_id);
+    assert(p4.screen_w == 1168U && p4.screen_h == 540U);
+    assert(p4.gimbal_mode == P4_GIMBAL_MODE_2);
+
+    /* 1. Verify XL9535 output word safety invariants (IO0 3.3V_POWER_EN=0, IO10 USB_PHY=1, IO1 SKY13453_VCTL) */
+    uint16_t xl_int = p4_trx_build_xl9535_output_word(&p4, true, true, true);
+    assert((xl_int & P4_XL_BIT_3V3_POWER_EN) == 0U);      /* Active-low 3.3V rail MUST be 0 */
+    assert((xl_int & P4_XL_BIT_USB_PHY_PWR_EN) != 0U);    /* USB PHY rail MUST be 1 */
+    assert((xl_int & P4_XL_BIT_SKY13453_VCTL) != 0U);     /* Internal antenna = 1 */
+    assert((xl_int & P4_XL_BIT_LORA_RST) != 0U);
+
+    p4.antenna_path = P4_ANTENNA_MMCX1;
+    uint16_t xl_ext = p4_trx_build_xl9535_output_word(&p4, true, true, true);
+    assert((xl_ext & P4_XL_BIT_3V3_POWER_EN) == 0U);
+    assert((xl_ext & P4_XL_BIT_SKY13453_VCTL) == 0U);     /* External MMCX1 antenna = 0 */
+
+    /* 2. Verify T-Display P4 LR2021 RF Front-End setup (3.0V TCXO + AT2401C +5 dBm HF cap + 22 dBm LF) */
+    p4_lr2021_rf_setup_t rf_hf = {}, rf_lf = {};
+    p4_trx_compute_lr2021_rf_setup(2440000000UL, 20, &rf_hf);
+    assert(rf_hf.tcxo_tune == P4_LR2021_TCXO_TUNE_3V0);
+    assert(rf_hf.tcxo_timeout == P4_LR2021_TCXO_TIMEOUT_TICKS);
+    assert(rf_hf.pa_sel == 1U); /* HF PA */
+    assert(rf_hf.power_half_dbm == 10); /* Capped at +5 dBm (10 half-dBm) for AT2401C input! */
+    assert(rf_hf.dio_rf_sw_map[0] == 0x04U && rf_hf.dio_rf_sw_map[1] == 0x08U);
+    assert(rf_hf.dio_rf_sw_map[2] == 0x03U && rf_hf.dio_rf_sw_map[3] == 0x0CU);
+
+    p4_trx_compute_lr2021_rf_setup(868000000UL, 22, &rf_lf);
+    assert(rf_lf.pa_sel == 0U); /* LF PA */
+    assert(rf_lf.power_half_dbm == 44); /* +22 dBm (44 half-dBm) */
+
+    /* 3. Verify Simultaneous Multi-Touch: Left Thumb + Right Thumb + Bottom ARM Switch Tap */
+    p4_touch_frame_t tf = {};
+    tf.count = 3U;
+    /* Finger 0: Left gimbal pushed full top-right (Throttle = +1.0, Yaw = +1.0 in Mode 2) */
+    tf.points[0] = {.valid = true, .id = 0U, .x = 260U, .y = 138U, .pressure = 40U};
+    /* Finger 1: Right gimbal pushed bottom-left (Pitch = -1.0, Roll = -1.0 in Mode 2) */
+    tf.points[1] = {.valid = true, .id = 1U, .x = (uint16_t)(p4.screen_w - 260U), .y = 374U, .pressure = 40U};
+    /* Finger 2: Tap SW0 (ARM switch at bottom-left x=40, y=510) */
+    tf.points[2] = {.valid = true, .id = 2U, .x = 40U, .y = 510U, .pressure = 30U};
+
+    p4_trx_process_touch(&p4, &tf, 1000UL);
+    assert(p4.sw_armed == true);
+    assert(p4.last_feedback == P4_FEEDBACK_ARM);
+    assert(p4.crsf_channels[0] == ELRS_CRSF_CH_MIN); /* CH1 Roll = 172 */
+    assert(p4.crsf_channels[1] == ELRS_CRSF_CH_MIN); /* CH2 Pitch = 172 */
+    assert(p4.crsf_channels[2] == ELRS_CRSF_CH_MAX); /* CH3 Throttle = 1811 */
+    assert(p4.crsf_channels[3] == ELRS_CRSF_CH_MAX); /* CH4 Yaw = 1811 */
+    assert(p4.crsf_channels[4] == 1792U);            /* CH5 Armed = 1792 */
+
+    /* Release all fingers: Roll/Pitch/Yaw spring back to 992, while Mode 2 Throttle stays sticky at 1811! */
+    p4_touch_frame_t empty_tf = {};
+    p4_trx_process_touch(&p4, &empty_tf, 1050UL);
+    assert(p4.crsf_channels[0] == ELRS_CRSF_CH_MID);
+    assert(p4.crsf_channels[1] == ELRS_CRSF_CH_MID);
+    assert(p4.crsf_channels[2] == ELRS_CRSF_CH_MAX); /* Sticky throttle preserved */
+    assert(p4.crsf_channels[3] == ELRS_CRSF_CH_MID);
+
+    /* Enable IMU Tilt-to-Steer (ICM20948 at +15 deg roll, -15 deg pitch) and verify CH1/CH2 deflection */
+    p4.imu.imu_present  = true;
+    p4.imu.is_icm20948  = true;
+    p4.imu.roll_deg     = 15.0f;
+    p4.imu.pitch_deg    = -15.0f;
+    p4.sw_imu_tilt_steer = true;
+    p4_trx_update_crsf_channels(&p4);
+    assert(p4.crsf_channels[0] > 1300U); /* Roll tilted right */
+    assert(p4.crsf_channels[1] < 680U);  /* Pitch tilted down */
+    p4.sw_imu_tilt_steer = false;
+    p4_trx_update_crsf_channels(&p4);
+
+    /* 4. Verify L76K GNSS NMEA ($GNGGA + $GNRMC) parsing & Follow-Me RNSF Formation Leader packet */
+    const char *gga = "$GNGGA,123519.00,5130.4410,N,00007.6655,W,1,11,0.8,62.5,M,47.0,M,,*76\r\n";
+    /* Compute exact NMEA checksum dynamically to verify parser */
+    char gga_valid[96];
+    const char *gga_body = "GNGGA,123519.00,5130.4410,N,00007.6655,W,1,11,0.8,62.5,M,47.0,M,,";
+    uint8_t cs = 0U;
+    for (const char *q = gga_body; *q; q++) cs ^= (uint8_t)(*q);
+    snprintf(gga_valid, sizeof(gga_valid), "$%s*%02X\r\n", gga_body, (unsigned)cs);
+    (void)gga;
+
+    bool got_gga = false;
+    for (const char *q = gga_valid; *q; q++) {
+        if (p4_trx_gnss_feed_byte(&p4.gnss, *q)) got_gga = true;
+    }
+    assert(got_gga);
+    assert(p4.gnss.fix_valid && p4.gnss.satellites == 11U);
+    assert(p4.gnss.lat_deg_e7 > 515070000L && p4.gnss.lat_deg_e7 < 515080000L);
+    assert(p4.gnss.lon_deg_e7 < -1277000L && p4.gnss.lon_deg_e7 > -1278000L);
+    assert(p4.gnss.alt_mm == 62500L);
+
+    const char *rmc_body = "GNRMC,123520.00,A,5130.4410,N,00007.6655,W,10.00,090.0,021126,,,A";
+    cs = 0U;
+    for (const char *q = rmc_body; *q; q++) cs ^= (uint8_t)(*q);
+    char rmc_valid[96];
+    snprintf(rmc_valid, sizeof(rmc_valid), "$%s*%02X\r\n", rmc_body, (unsigned)cs);
+    bool got_rmc = false;
+    for (const char *q = rmc_valid; *q; q++) {
+        if (p4_trx_gnss_feed_byte(&p4.gnss, *q)) got_rmc = true;
+    }
+    assert(got_rmc);
+    assert(p4.gnss.groundspeed_cms >= 514U && p4.gnss.groundspeed_cms <= 515U); /* 10 knots = 514.4 cm/s */
+    assert(p4.gnss.heading_cdeg == 9000U); /* 90.0 deg East */
+
+    p4.sw_formation = RNS_FORM_VEE;
+    uint8_t form_pkt[64] = {0};
+    assert(p4_trx_build_follow_me_formation_pkt(&p4, form_pkt) == 64U);
+    rns_formation_pkt_t parsed_f = {};
+    assert(rns_parse_formation_pkt(form_pkt, 64U, &parsed_f));
+    assert(parsed_f.leader_lat_e7 == p4.gnss.lat_deg_e7);
+    assert(parsed_f.leader_lon_e7 == p4.gnss.lon_deg_e7);
+    assert(parsed_f.vy_cms > 500 && abs(parsed_f.vx_cms) < 5); /* Moving East at ~5.14 m/s */
+
+    /* 5. Verify ExpressLRS TX frame generator & Swarm UI tab button taps (RNSP, RNSM, RNSC) */
+    p4.active_page = P4_PAGE_SWARM;
+    p4_touch_frame_t tap_rnsm = {};
+    tap_rnsm.count = 1U;
+    tap_rnsm.points[0] = {.valid = true, .id = 0U, .x = 700U, .y = 135U, .pressure = 30U}; /* [4-DRONE RNSM] */
+    p4_trx_process_touch(&p4, &tap_rnsm, 2000UL);
+    p4_trx_process_touch(&p4, &empty_tf, 2020UL);
+    assert(p4.pending_rns_len == 64U);
+    assert(elrs_tunnel_has_pending_tx(&p4.tunnel));
+
+    /* Step TX frames and reassemble the tunneled 64B RNSM packet on a simulated receiver */
+    elrs_data_tunnel_t rx_tun;
+    elrs_tunnel_init(&rx_tun, 1U);
+    uint8_t reassembled[128] = {0};
+    uint16_t reassembled_len = 0U;
+    bool got_tunneled_rnsm = false;
+    for (int f = 0; f < 64; f++) {
+        uint32_t rf_hz = 0UL;
+        uint8_t ota_pkt[16] = {0};
+        size_t plen = p4_trx_step_elrs_tx_frame(&p4, &rf_hz, ota_pkt);
+        assert(plen == ELRS_OTA4_PACKET_SIZE);
+        assert(rf_hz >= 2400000000UL);
+        if ((ota_pkt[0] & 0x03U) == ELRS_PKT_TYPE_DATA) {
+            if (elrs_tunnel_process_rx_frame(&rx_tun, ota_pkt, false, reassembled, &reassembled_len)) {
+                got_tunneled_rnsm = true;
+            }
+        }
+    }
+    assert(got_tunneled_rnsm && reassembled_len == 64U);
+    rns_multi_drone_pkt_t rx_mp = {};
+    assert(rns_parse_multi_drone_pkt(reassembled, reassembled_len, &rx_mp));
+    assert(rx_mp.slot_mask == 0x0FU);
+
+    /* 6. Verify RGB565 Landscape Renderer across all 4 UI pages + Portrait MIPI-DSI rotation */
+    std::vector<uint16_t> land_fb((size_t)p4.screen_w * p4.screen_h, 0U);
+    std::vector<uint16_t> port_fb((size_t)p4.screen_w * p4.screen_h, 0U);
+    for (int pg = 0; pg < (int)P4_PAGE_COUNT; pg++) {
+        p4.active_page = (p4_ui_page_t)pg;
+        p4_trx_render_landscape_rgb565(&p4, land_fb.data());
+        /* Verify non-uniform rendered pixels across top bar, gimbals, center console, and bottom switches */
+        assert(land_fb[14 * p4.screen_w + 20] != land_fb[0]);
+        assert(land_fb[268 * p4.screen_w + 142] != 0U);
+        assert(land_fb[(p4.screen_h - 30) * p4.screen_w + 50] != 0U);
+    }
+    p4_trx_blit_landscape_to_portrait_rgb565(land_fb.data(), port_fb.data(), p4.screen_w, p4.screen_h);
+    /* Verify pixel at Landscape (lx=20, ly=14) maps to Portrait (px = 539 - 14 = 525, py = 20) */
+    assert(port_fb[20 * p4.screen_h + (p4.screen_h - 1U - 14U)] == land_fb[14 * p4.screen_w + 20]);
+
+    printf("[PASS] test_t_display_p4_trx_unit (LilyGo T-Display P4 Dual-Gimbal Touch, TCXO+AT2401C, L76K Follow-Me, RGB565 HUD)\n");
+}
+
 int main(void) {
     test_uid_md5();
     test_fhss_invariants();
@@ -1629,6 +1795,7 @@ int main(void) {
     test_multi_drone_mesh_and_formation();
     test_slot_tdma_and_multi_drone_bundle();
     test_xr4_lr1121_dual_radio_and_bridge();
+    test_t_display_p4_trx_unit();
     printf("All host unit tests PASSED.\n");
     return 0;
 }

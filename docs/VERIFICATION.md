@@ -12,7 +12,7 @@ This document records the hardware and simulation tests run against the `lr2021-
 
 ## 1. Host Unit Tests (`tests/test_elrs_host.cpp`)
 
-All 14 host unit test suites run cleanly under `g++`:
+All 15 host unit test suites run cleanly under `g++`:
 1. `test_uid_md5`: ExpressLRS MD5 binding phrase to 6-byte UID derivation.
 2. `test_fhss_invariants`: FHSS hop sequence generation across `AU915`, `FCC915`, `EU868`, and `ISM2G4`.
 3. `test_ota4_and_ota8_roundtrip`: `SYNC`, `RC4`, `RC8`, and `LINKSTATS` packing, unpacking, and `CRC14`/`CRC16`.
@@ -27,6 +27,7 @@ All 14 host unit test suites run cleanly under `g++`:
 12. `test_multi_drone_mesh_and_formation`: 64-byte `RNSF` formation packets, multi-hop ping-pong relay chain with hop and TTL expiration, and MAVLink `#84`/`#86` velocity/position-velocity frames.
 13. `test_slot_tdma_and_multi_drone_bundle`: Deterministic `(slot_id - 1) × 45 ms` Slot-TDMA relay windows and 64-byte `RNSM` (`0xA8`) 4-drone command bundle roundtrip + tamper rejection.
 14. `test_xr4_lr1121_dual_radio_and_bridge`: RadioMaster XR4 (`2× Semtech LR1121`) SPI driver initialization (`0x0112` RF switch `{15,0,12,8,8,6,0,5}`, `HF_PA`/`HP_PA`, 8B↔14B Hamming FEC with 1-bit error correction) and simultaneous `2G4_K1000` ELRS + `868 MHz` `RNSM` LoRa mesh bridging + `45 ms` Slot-TDMA relay without interrupting 2.4 GHz FHSS hops.
+15. `test_t_display_p4_trx_unit`: LilyGo T-Display P4 (`ESP32-P4NRW32` + `RM69A10` `1232×568` AMOLED / `HI8561` `1168×540` TFT + `Semtech LR2021`) dual-gimbal touch mapping, `TCXO 3.0 V` + `AT2401C` FEM + `SKY13453` RF switch init sequence, `L76K` NMEA `$GNGGA` parser, GPS Follow-Me formation leader broadcasts, and Landscape RGB565 HUD rendering.
 
 ---
 
@@ -110,3 +111,24 @@ Verified using [`tools/rns_multi_drone_sitl.py`](../tools/rns_multi_drone_sitl.p
    - **Hybrid 200 Hz `ELRS_RX` -> 868 MHz LoRa Mesh Burst**: While locked on `EU868 900_200HZ` (`ELRS_TX` -> `ELRS_RX`), tunneling `rns_multi` over odd FHSS nonces triggered `ELRS_RNS_RX len=64` -> `RNS_HYBRID_BURST_TX len=64 hops=1 freq=868000000 burst_cnt=1` on the single-radio receiver while `TIMER20` maintained `OtaNonce` + `FHSS` lock (`STATUS mode=ELRS_RX lock=CONNECTED crc_ok=358 crc_err=3 phase_err=-12us`).
    - **Autonomous Leader Formation Broadcast (`rns_form auto vee 12.0 450 4.0 0.0`)**: Board 1 in `ELRS_RX` mode automatically broadcast 64B `RNSF` LoRa bursts every `450 ms`, which Board 2 (`RELAY`, `Slot 1`) decoded over 868 MHz RF (`RNS_FORM_RX src=LORA hops=0 seq=1..3 shape=2 slot=1 lat=-353633697 lon=1491651049 vx=400 mav_len=65`) and forwarded (`RNS_RELAY_FWD len=64 hops=1`).
    - **Cross-Band Live Bench Loop (`TX16S MK3 + XR4 + TMotorH743` on `2G4_K1000 CE_LBT` -> `868.0 MHz` `RNSM` LoRa Burst -> Wingman `D56B6941`)**: With `FC6D1A37` locked to the live `TX16S MK3 ↔ XR4` 1000 Hz 2.4 GHz link (`UID=EB:71:09:FA:46:6A`, `vbatt=16024 mV`, `chancount=16`), firing `rns_multi OFS:-10,-15,5 VEL:5,-2,0 LOITER RTL` switched `FC6D1A37` from `2.4 GHz GFSK` to `868.0 MHz LoRa` (`RNS_HYBRID_BURST_TX len=64`), delivered `MAVLink #86` (`mav_len=65`, `rssi=-90 dBm`, `snr=+15 dB`) to `D56B6941`, and snapped back to `2G4_K1000` while maintaining lock (`crc_ok: 1438 -> 2175`, `hops: 1088 -> 1913`, `phase_err: 6 us -> 3 us`).
+
+---
+
+## 7. LilyGo T-Display P4 (`ESP32-P4NRW32` + `RM69A10` AMOLED + `Semtech LR2021`) Dual-Band OTA Verification
+
+Verified on a USB-attached **LilyGo T-Display P4** (`/dev/ttyACM7`, MAC `30:ed:a0:e1:c3:58`) transmitting simultaneously to both `XIAO nRF54L15 + Wio-LR2021` receivers (`RX5` on `/dev/ttyACM5` and `RX6` on `/dev/ttyACM6`):
+
+1. **Onboard Peripheral Bring-Up**:
+   - `32 MB` Hex PSRAM at `200 MHz` (`MSPI DQS: tuning success`, `SPI SRAM memory test OK`).
+   - Auto-detected `GT9895` multi-touch (`0x5D` on `I2C1`) and `RM69A10` `568×1232` AMOLED panel (`1232×568` Landscape RGB565 HUD rendered over MIPI-DSI).
+   - `Semtech LR2021` on `SPI2` (`GET_VERSION = 0x0118`, `TCXO = 3.0 V` on `DIO3`, `AT2401C` 2.4 GHz FEM on `DIO7/DIO8`, `SKY13453` Sub-GHz RF switch on `DIO9`).
+   - `BQ27220` fuel gauge (`4106–4110 mV`, `95%` SoC), `ICM20948` 9-axis IMU (`0x68` on `I2C2`), `AW86224` haptic driver (`0x58`), and `XL9535` I/O expander (`0x20`).
+2. **2.4 GHz Band (`2G4_250HZ`, `rate=18`, `ISM2G4`, `+5 dBm` via `AT2401C` FEM)**:
+   - `RX5` (`/dev/ttyACM5`): `lock=CONNECTED`, `crc_ok=1021/1054` (`96.9%`), `rssi=-66 dBm`, `snr=13.75 dB`, `phase_err=-28 us`.
+   - `RX6` (`/dev/ttyACM6`): `lock=CONNECTED`, `crc_ok=1034/1104` (`93.7%`), `rssi=-80 dBm`, `snr=12.50 dB`, `phase_err=-17 us`.
+   - Live virtual gimbal + arm deflection (`arm 1` + `stick lx=-0.5 ly=0.75 rx=0.6 ry=-0.25` -> `CH1=1421 CH2=825 CH3=1606 CH4=644 CH5=1792`) tracked on both `RX5` and `RX6` as `RC_US ch1=1769 ch2=1397 ch3=1884 ch4=1284 ch5=2000 armed=1`.
+   - Tunneled 64B `RNSF #1` (`rns_form 0`) and 64B `RNSM #1` (`rns_multi`) reassembled on both receivers (`RNS_FORM_RX src=ELRS_TUNNEL seq=1`, `RNS_MULTI_RX src=ELRS_TUNNEL seq=1 slot=1 act=1 type=10 lat=515072602 lon=-1279023 alt_m=50 mav_len=65`) and bridged into 868 MHz LoRa mesh bursts (`RNS_HYBRID_BURST_TX`).
+3. **Sub-GHz 868 MHz Band (`900_200HZ`, `rate=3`, `EU868`, `+14 dBm` LF PA)**:
+   - `RX5` (`/dev/ttyACM5`): `lock=CONNECTED`, `crc_ok=953/965` (`98.8%`), `rssi=-70 dBm`, `snr=13.25 dB`, `phase_err=-26 us`.
+   - `RX6` (`/dev/ttyACM6`): `lock=CONNECTED`, `crc_ok=662/673` (`98.4%`), `rssi=-79 dBm`, `snr=12.75 dB`, `phase_err=-48 us`.
+   - Both `RX5` and `RX6` tracked `RC_US ch1=1769 ch2=1397 ch3=1884 ch4=1284 ch5=2000 armed=1` and received tunneled `RNSF #2` and `RNSM #2`.

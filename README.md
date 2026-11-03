@@ -1,8 +1,32 @@
 # lr2021-elrs
 
-Bare-metal firmware for the [Seeed Studio Semtech LR2021 LoRa Plus Evaluation Kit](https://www.seeedstudio.com/LR2021-LoRa-Plus-Evaluation-kit-868Mhz-EU-V2-0-p-6697.html) ([915 MHz US](https://www.seeedstudio.com/LR2021-LoRa-Plus-Evaluation-kit-915Mhz-US-V2-0-p-6698.html) / [Seeed Wiki](https://wiki.seeedstudio.com/semtech_lr2021_evk_getting_started/)), pairing a `Seeed Studio XIAO nRF54L15` MCU with a dual-band (Sub-GHz + 2.4 GHz) `Wio-LR2021` radio.
+[![License: AGPL v3+](https://img.shields.io/badge/License-AGPL_v3%2B-blue.svg)](LICENSE)
 
-The firmware combines **ExpressLRS v3/v4 RC control** with **Reticulum (`rnsd`) mesh networking**, an **RNode KISS TNC**, an **ArduPilot MAVLink v2 flight-controller bridge**, and **multi-drone formation flight**.
+Dual-band (Sub-GHz + 2.4 GHz) **ExpressLRS v3/v4 RC control**, **Reticulum (`rnsd`) mesh networking**, **RNode KISS TNC**, **ArduPilot MAVLink v2 flight-controller bridge**, and **multi-drone formation flight** firmware for three hardware targets built from a shared C++ protocol core:
+
+1. **[Seeed Studio Semtech LR2021 LoRa Plus Evaluation Kit](https://www.seeedstudio.com/LR2021-LoRa-Plus-Evaluation-kit-868Mhz-EU-V2-0-p-6697.html)** ([915 MHz US](https://www.seeedstudio.com/LR2021-LoRa-Plus-Evaluation-kit-915Mhz-US-V2-0-p-6698.html) / [Seeed Wiki](https://wiki.seeedstudio.com/semtech_lr2021_evk_getting_started/)): `Seeed Studio XIAO nRF54L15` + `Wio-LR2021` transceiver (`ELRS_TX`, `ELRS_RX`, `RNODE`, `RELAY`, `MONITOR`).
+2. **[LilyGo T-Display P4](https://lilygo.cc/products/t-display-p4)**: Standalone handheld Drone TRX Unit (`ESP32-P4NRW32` + `1232×568` `RM69A10` AMOLED / `1168×540` `HI8561` TFT multi-touch display + onboard `Semtech LR2021` + `AT2401C` 2.4 GHz FEM + `ICM20948` IMU + `L76K` GNSS + `BQ27220` fuel gauge).
+3. **RadioMaster XR4**: True dual-band receiver/mesh bridge (`ESP32-PICO-D4` + `2× Semtech LR1121`) running simultaneous 2.4 GHz `2G4_K1000` ExpressLRS and 868 MHz Reticulum LoRa mesh.
+
+---
+
+## Hero Screenshots
+
+### LilyGo T-Display P4 Standalone Drone TRX Unit (`1232×568` Landscape AMOLED HUD)
+
+<p align="center">
+  <img src="docs/images/t_display_p4_hud.png" width="900" alt="LilyGo T-Display P4 Landscape Flight HUD (1232x568 RM69A10 AMOLED)"/>
+</p>
+
+| `2: ELRS` (Air Rate, Domain, Power & Antenna) | `3: SWARM` (`RNSP` Pair, `RNSF` Vee/Line & `RNSM` 4-Drone Bundle) | `4: SPEC` (`LR2021` Spectrum Waterfall, IMU & Fuel Gauge) |
+| :---: | :---: | :---: |
+| <img src="docs/images/t_display_p4_elrs.png" width="380" alt="T-Display P4 ELRS RF Configuration Page"/> | <img src="docs/images/t_display_p4_swarm.png" width="380" alt="T-Display P4 Reticulum Swarm Page"/> | <img src="docs/images/t_display_p4_spectrum.png" width="380" alt="T-Display P4 LR2021 Spectrum and Sensors Page"/> |
+
+### Reticulum `RNodeInterface` & Sideband v1.9.8 ↔ 867.2 MHz LoRa ↔ ArduPilot `TMotorH743`
+
+| Announce Discovery (`867.2 MHz`) | Contact & Quadcopter Icon | Bidirectional `rtl` -> `TMotorH743` | Live `TMotorH743` Telemetry |
+| :---: | :---: | :---: | :---: |
+| <img src="docs/images/sideband_announce_stream.png" width="210" alt="Sideband Announce Stream"/> | <img src="docs/images/sideband_conversations_quadcopter.png" width="210" alt="Sideband Quadcopter Contact"/> | <img src="docs/images/sideband_rtl_command_chat.png" width="210" alt="Sideband RTL Command Execution"/> | <img src="docs/images/sideband_telemetry_details.png" width="210" alt="Sideband Telemetry Details"/> |
 
 ---
 
@@ -52,6 +76,7 @@ flowchart LR
 - **Multi-Drone Formation (`RNSF`) & Multi-Slot Command Bundles (`RNSM`)**: Distributes 64-byte signed formation packets (`VEE`, `LINE`, `COLUMN`, `HOLD`, including periodic `rns_form auto`) and 64-byte 4-slot independent command bundles (`rns_multi` with per-slot `OFS:n,e,d`, `VEL:vn,ve,vd`, `LOITER`, `RTL`, `LAND`, `ARM`, `DISARM`), backed by a 3.0 s dead-man `LOITER` watchdog.
 - **Hybrid `ELRS_RX` LoRa Burst & Deterministic Slot-TDMA**: A single-radio Lead Drone in `ELRS_RX` mode can remain phase-locked to a 200 Hz / 1000 Hz ExpressLRS RC link while injecting `~33 ms` 868 MHz LoRa bursts (`BW500 SF7`) into the follower mesh. Followers (`Slots 1..7`) relay swarm packets in non-overlapping `(slot_id - 1) × 45 ms` TDMA windows to avoid half-duplex collisions.
 - **Unified RadioMaster XR4 (`ESP32-PICO-D4 + 2× Semtech LR1121`) Target**: Builds from the same protocol tree via PlatformIO (`pio run -e radiomaster_xr4`), dedicating **Radio 1 (`LR1121 #1`)** full-time to 2.4 GHz `2G4_K1000` ExpressLRS and **Radio 2 (`LR1121 #2`)** full-time to the 868 MHz Reticulum LoRa mesh with zero time-slicing.
+- **LilyGo T-Display P4 Standalone Drone TRX Unit (`ESP32-P4NRW32 + MIPI-DSI Touch + Semtech LR2021`)**: Turns the LilyGo T-Display P4 (`targets/t_display_p4/` + `firmware/p4_trx/`) into a handheld Landscape (`1232×568` RM69A10 AMOLED / `1168×540` HI8561 TFT) ExpressLRS + Reticulum Swarm transmitter with dual multi-touch virtual gimbals (Modes 1–4), 8 auxiliary switches, `ICM20948`/`QMI8658` IMU tilt-to-steer, `L76K` GNSS "Follow-Me" formation leader broadcasts (`RNSF`/`RNSM`), `BQ27220` fuel-gauge telemetry, `AW86224` haptics, and dual-band (`AT2401C` 2.4 GHz + Sub-GHz) `LR2021` RF output.
 
 ### Hardware & Radio Constraints
 - **Single Transceiver (`Wio-LR2021`) vs Dual Transceiver (`RadioMaster XR4 2× LR1121`)**: Each `Wio-LR2021` board has one PLL/baseband path, so `ELRS_RX` bridges to the 868 MHz LoRa mesh by time-slicing brief LoRa bursts while `TIMER20` tracks `OtaNonce` and `FHSS` hops in the background. On the **RadioMaster XR4** target (`2× LR1121`), Radio 1 stays on 2.4 GHz ELRS continuously while Radio 2 runs 868 MHz Reticulum LoRa mesh simultaneously.
@@ -62,7 +87,7 @@ flowchart LR
 
 ## Build, Test & Flash
 
-### 1. Build Firmware (`XIAO nRF54L15 + Wio-LR2021` & `RadioMaster XR4`)
+### 1. Build Firmware (`XIAO nRF54L15 + Wio-LR2021`, `RadioMaster XR4`, & `LilyGo T-Display P4`)
 ```bash
 # Build XIAO nRF54L15 + Wio-LR2021 firmware (arm-none-eabi-gcc 12+, cmake 3.20+)
 cmake -B build -DCMAKE_TOOLCHAIN_FILE=firmware/toolchain-arm-none-eabi.cmake -DCMAKE_BUILD_TYPE=Release
@@ -70,18 +95,23 @@ cmake --build build -j$(nproc)
 
 # Build RadioMaster XR4 (ESP32-PICO-D4 + 2x LR1121) firmware (PlatformIO)
 pio run -e radiomaster_xr4
+
+# Build LilyGo T-Display P4 (ESP32-P4NRW32 + MIPI-DSI + LR2021) firmware (ESP-IDF v5.4+)
+ninja -C targets/t_display_p4/build
 ```
 
-### 2. Run Host Unit Tests (14 Suites, Including Embedded Lua 5.2 VM & Dual-LR1121 XR4)
+### 2. Run Host Unit Tests (15 Suites, Including Embedded Lua 5.2 VM, Dual-LR1121 XR4, & T-Display P4 TRX)
 ```bash
 mkdir -p build_host
 g++ -std=c++17 -O2 -Wall -Wextra -I. \
+    -Ifirmware/elrs -Ifirmware/crsf -Ifirmware/rnode -Ifirmware/p4_trx -Ifirmware/radio \
     tests/test_elrs_host.cpp \
     firmware/elrs/elrs_protocol.cpp \
     firmware/crsf/crsf.cpp \
     firmware/rnode/rns_node.cpp \
+    firmware/p4_trx/p4_trx_core.cpp \
     firmware/radio/lr1121_driver.cpp \
-    -ldl -o build_host/test_elrs_host
+    -ldl -lm -o build_host/test_elrs_host
 ./build_host/test_elrs_host
 ```
 
